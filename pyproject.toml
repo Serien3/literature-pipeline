@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "literature-pipeline"
+version = "0.1.0"
+description = "Import Zotero metadata and link local PDFs into an Obsidian vault"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
+
+[project.scripts]
+literature-pipeline = "literature_pipeline.cli:main"
+
+[tool.setuptools]
+packages = ["literature_pipeline"]
+
+[tool.setuptools.package-dir]
+"literature_pipeline" = "literature_pipeline"
