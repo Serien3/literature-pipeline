@@ -2,7 +2,7 @@
 
 把 Zotero Collection 中的书目元数据一次性导入用户自己的 Obsidian vault。
 
-本程序创建论文文件夹、Zotero 原始元数据快照、用于 Obsidian 浏览的 `meta.md`，并以符号链接引入 Zotero 已保存在本机的 PDF。它不复制或下载 PDF、不转换全文、不生成阅读笔记，也不会在首次入库后继续同步或覆盖元数据。完整产品规格见 [v1_spec.md](v1_spec.md)。
+本程序创建论文文件夹、Zotero 原始元数据快照、用于 Obsidian 浏览的 `meta.md`，并以符号链接引入 Zotero 已保存在本机的 PDF。它不复制或下载 PDF、不转换全文、不生成阅读笔记，也不会在首次入库后继续同步或覆盖元数据。完整产品规格见 [docs/v1_spec.md](docs/v1_spec.md)。
 
 ```text
 论文网页 → Zotero Connector → 指定 Collection → <vault>/<可读标题> [<zotero-key>]/{metadata, PDF links}
@@ -112,5 +112,21 @@ v1 只支持个人库中的一个 Collection、直接成员和 Zotero Local API�
 测试使用临时目录和模拟 Zotero，不修改真实 Zotero 或用户 vault：
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+仓库采用常见的 `src` 布局，避免测试时意外导入未安装的源码：
+
+```text
+literature-pipeline/
+├── src/literature_pipeline/   # 可安装的应用包
+├── tests/                     # 自动化测试
+├── docs/                      # 产品文档和产品规格
+├── tools/pdf2md/              # 独立的 MinerU 辅助工具
+├── CONTRIBUTING.md            # 贡献指南
+├── pyproject.toml             # 构建、依赖和工具配置
+└── README.md
+```
+
+提交修改前请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。独立 PDF 转换工具的安装和用法见 [tools/pdf2md/README.md](tools/pdf2md/README.md)。
