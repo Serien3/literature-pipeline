@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "mineru-open-sdk==0.2.5",
+    "prompt-toolkit>=3.0.52,<4",
     "python-dotenv==1.0.1",
     "PyYAML>=6.0,<7",
 ]

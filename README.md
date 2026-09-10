@@ -2,19 +2,26 @@
 
 把 Zotero Collection 中的书目元数据与本机 PDF 一次性导入用户自己的 Obsidian vault，并按用户明确选择，通过 MinerU 将 PDF 转成便于 agent 阅读的 Markdown。
 
-本程序的 `sync` 创建论文文件夹、Zotero 原始元数据快照、用于 Obsidian 浏览的 `meta.md`，并以符号链接引入 Zotero 已保存在本机的 PDF，但绝不调用 MinerU。用户随后通过独立的 `convert` 命令查看候选论文并明确选择一个或多个 key；只有这一步会上传 PDF 和消耗 MinerU 额度。完整产品规格见 [docs/v2_spec.md](docs/v2_spec.md)。
+本程序的 `sync` 创建论文文件夹、Zotero 原始元数据快照、用于 Obsidian 浏览的 `meta.md`，并以符号链接引入 Zotero 已保存在本机的 PDF，但绝不调用 MinerU。用户随后通过独立的 `convert` 命令在终端界面中明确选择论文，或使用 `--key` 进行非交互调用；只有确认选择后才会上传 PDF 和消耗 MinerU 额度。完整产品规格见 [docs/v2_spec.md](docs/v2_spec.md)。
 
 ```text
-论文网页 → Zotero Connector → sync → {metadata, PDF links} → convert --key → {full.md, images, temp}
+论文网页 → Zotero Connector → sync → {metadata, PDF links} → convert（TUI/--key）→ {full.md, images, temp}
 ```
 
 ## 安装
 
-生产环境为 Zotero 所在的 Windows 电脑，需要 Python 3.11 或更新版本：
+支持在 Zotero 所在的 Windows 或 Linux 电脑上运行，需要 Python 3.11 或更新版本。Windows 安装：
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
+```
+
+Linux 安装：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
 MinerU SDK 已是主程序依赖，不需要为 `tools/pdf2md` 另建虚拟环境。
@@ -25,7 +32,7 @@ MinerU SDK 已是主程序依赖，不需要为 `tools/pdf2md` 另建虚拟环�
 .\.venv\Scripts\literature-pipeline.exe collections
 ```
 
-PDF 使用 Windows 文件符号链接。请先在 Windows 设置中开启“开发者模式”，或使用具备创建符号链接权限的终端；`doctor` 会实际检查该能力。
+PDF 使用文件符号链接。Windows 请先开启“开发者模式”，或使用具备创建符号链接权限的终端；Linux 使用当前文件系统的标准符号链接能力。`doctor` 会实际检查该能力。
 
 ## 初始化已有或新的 vault
 
@@ -101,14 +108,28 @@ PaperLibrary/
 
 ## PDF 转 Markdown
 
-先列出已有论文的转换状态；这一步不要求 MinerU Token，也不消耗额度：
+在 Windows Terminal、PowerShell 或 Linux 终端中直接运行 `convert`，会先检查已有论文，然后打开交互式多选界面：
+
+```powershell
+.\.venv\Scripts\literature-pipeline.exe convert
+```
+
+Linux 中对应为：
+
+```bash
+literature-pipeline convert
+```
+
+界面显示全部状态，但只有 `Ready` 可以选择。初始不选择任何论文；使用方向键移动、Space 选择、`a` 全选当前搜索结果中的 Ready 项、`/` 搜索，Enter 进入额度确认，`q` 取消。当前论文的不可转换原因始终显示在详情区。确认退出界面后，所选论文按列表顺序串行转换。
+
+如果只需要查看状态，或需要在脚本和非交互终端中使用，保留纯文本列表模式；这一步不要求 MinerU Token，也不消耗额度：
 
 ```powershell
 .\.venv\Scripts\literature-pipeline.exe convert `
   --list
 ```
 
-状态包括 `Ready`、`Converted`、`No PDF`、`Multiple`、`Unavailable` 和 `Conflict`。只有 `Ready` 可以提交转换。选择一个或多个 Zotero item key：
+状态包括 `Ready`、`Converted`、`No PDF`、`Multiple`、`Unavailable` 和 `Conflict`。也可以绕过 TUI，明确传入一个或多个 Zotero item key：
 
 ```powershell
 .\.venv\Scripts\literature-pipeline.exe convert `
@@ -116,7 +137,7 @@ PaperLibrary/
   --key EFGH5678
 ```
 
-不提供隐式“全部转换”；没有明确的 `--key` 时命令不会运行。历史已入库论文和刚完成 `sync` 的论文采用同一选择方式。
+不提供隐式“全部转换”：TUI 初始选择为空，必须勾选论文并再次确认；`--key` 本身则构成非交互转换授权。裸 `convert` 在 stdin 或 stdout 不是终端时会报错，并提示改用 `--list` 或 `--key`。历史已入库论文和刚完成 `sync` 的论文采用同一选择方式。
 
 运行转换前，将 Token 写入真实环境变量 `MINERU_TOKEN`，或写入 `<vault>\.pipeline\.env`：
 
@@ -124,7 +145,7 @@ PaperLibrary/
 MINERU_TOKEN='你的 Token'
 ```
 
-真实环境变量优先。Token 不写入 `config.toml`，也不会出现在命令汇总中。`sync` 和 `convert --list` 从不要求 Token。
+真实环境变量优先。Token 不写入 `config.toml`，也不会出现在命令汇总中。`sync`、`convert --list` 以及 TUI 的浏览和取消都不要求 Token；TUI 只有在用户确认选择后才读取 Token。
 
 每个被选择的条目必须满足：
 
@@ -137,7 +158,7 @@ MINERU_TOKEN='你的 Token'
 
 转换结果先下载到论文目录内的隐藏暂存目录。程序删除 MinerU 返回包顶层附带的 PDF 副本、整理辅助文件并验证普通文件 `full.md` 存在，然后把结果直接展开到论文目录。`full.md`、`images/`、`temp/` 或其他待发布名称只要已经存在，程序就保留原内容并令转换失败，不覆盖或合并。
 
-多个 `--key` 按顺序串行转换；单篇失败不阻止后续选择。程序不自动重试，只有用户再次明确传入 key 才会重新检查并尝试。
+多个 `--key` 按命令行顺序串行转换；TUI 选择按界面列表顺序串行转换。单篇失败不阻止后续选择。程序不自动重试，只有用户再次通过 TUI 确认或明确传入 key 才会重新检查并尝试。
 
 符号链接不复制 PDF 内容，可以跨磁盘，但它仍是 Zotero 原文件的另一个入口：通过链接编辑 PDF 会直接修改 Zotero 文件；跨电脑同步 vault 或移动 Zotero 数据目录后链接可能失效。
 

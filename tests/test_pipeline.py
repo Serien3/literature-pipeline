@@ -10,7 +10,11 @@ from unittest.mock import patch
 import yaml
 
 from literature_pipeline.cli import _vault, main
-from literature_pipeline.conversion import ConversionService
+from literature_pipeline.conversion import (
+    ConversionCandidate,
+    ConversionService,
+    ConversionSummary,
+)
 from literature_pipeline.files import (
     PipelineError,
     VaultLock,
@@ -1143,6 +1147,119 @@ class AdapterAndCliTests(unittest.TestCase):
                 result = main(["convert", "--vault", str(vault), "--list"])
             self.assertEqual(result, 0)
             self.assertIn("PAPER001  Ready", output.getvalue())
+
+    def test_cli_bare_convert_runs_picker_then_loads_token_and_converts(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            ready = ConversionCandidate("PAPER001", vault / "Alpha", "Ready", "可以转换")
+            summary = ConversionSummary(selected=1, converted=1)
+            events = []
+            output = io.StringIO()
+
+            with (
+                patch("literature_pipeline.cli.supports_tui", return_value=True),
+                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.ConversionService") as service_type,
+                patch(
+                    "literature_pipeline.cli.run_conversion_picker",
+                    side_effect=lambda candidates: events.append(("picker", candidates))
+                    or ["PAPER001"],
+                ),
+                patch(
+                    "literature_pipeline.cli.load_vault_token",
+                    side_effect=lambda _vault: events.append(("token", None)) or "token",
+                ),
+                redirect_stdout(output),
+            ):
+                service = service_type.return_value
+                service.list_candidates.side_effect = (
+                    lambda: events.append(("list", None)) or [ready]
+                )
+                service.convert_selected.side_effect = (
+                    lambda keys, token: events.append(("convert", (keys, token))) or summary
+                )
+                result = main(["convert", "--vault", str(vault)])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                events,
+                [
+                    ("list", None),
+                    ("picker", [ready]),
+                    ("token", None),
+                    ("convert", (["PAPER001"], "token")),
+                ],
+            )
+            self.assertIn("正在检查论文转换状态", output.getvalue())
+
+    def test_cli_bare_convert_cancel_never_loads_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            ready = ConversionCandidate("PAPER001", vault / "Alpha", "Ready", "可以转换")
+            with (
+                patch("literature_pipeline.cli.supports_tui", return_value=True),
+                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.ConversionService") as service_type,
+                patch("literature_pipeline.cli.run_conversion_picker", return_value=None),
+                patch(
+                    "literature_pipeline.cli.load_vault_token",
+                    side_effect=AssertionError("token must not be loaded"),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                service_type.return_value.list_candidates.return_value = [ready]
+                result = main(["convert", "--vault", str(vault)])
+            self.assertEqual(result, 130)
+            service_type.return_value.convert_selected.assert_not_called()
+
+    def test_cli_bare_convert_without_papers_returns_without_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            output = io.StringIO()
+            with (
+                patch("literature_pipeline.cli.supports_tui", return_value=True),
+                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.ConversionService") as service_type,
+                patch(
+                    "literature_pipeline.cli.run_conversion_picker",
+                    side_effect=AssertionError("picker must not run"),
+                ),
+                patch(
+                    "literature_pipeline.cli.load_vault_token",
+                    side_effect=AssertionError("token must not be loaded"),
+                ),
+                redirect_stdout(output),
+            ):
+                service_type.return_value.list_candidates.return_value = []
+                result = main(["convert", "--vault", str(vault)])
+            self.assertEqual(result, 0)
+            self.assertIn("没有已完成入库的论文", output.getvalue())
+
+    def test_cli_bare_convert_rejects_non_interactive_terminal_before_zotero(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            output = io.StringIO()
+            with (
+                patch("literature_pipeline.cli.supports_tui", return_value=False),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be accessed"),
+                ),
+                redirect_stderr(output),
+            ):
+                result = main(["convert", "--vault", str(vault)])
+            self.assertEqual(result, 1)
+            self.assertIn("convert --list", output.getvalue())
+            self.assertIn("convert --key ITEM_KEY", output.getvalue())
+
+    def test_cli_convert_list_and_key_remain_mutually_exclusive(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(["convert", "--list", "--key", "PAPER001"])
 
     @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlinks unavailable")
     def test_cli_link_pdfs_reports_summary(self):

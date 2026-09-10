@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .conversion import ConversionService
+from .conversion_tui import run_conversion_picker, supports_tui
 from .files import PipelineError, VaultLock
 from .ingest import Importer
 from .library import initialize, load_config
@@ -45,9 +46,9 @@ def parser() -> argparse.ArgumentParser:
     link_pdfs.add_argument(
         "--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）"
     )
-    convert = commands.add_parser("convert", help="列出或转换明确选择的已入库论文")
+    convert = commands.add_parser("convert", help="交互选择、列出或转换已入库论文")
     convert.add_argument("--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）")
-    mode = convert.add_mutually_exclusive_group(required=True)
+    mode = convert.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true", help="列出所有论文的转换就绪状态")
     mode.add_argument(
         "--key",
@@ -153,6 +154,11 @@ def main(argv: list[str] | None = None) -> int:
 
         config = load_config(vault)
         if args.command == "convert":
+            if not args.list and args.keys is None and not supports_tui():
+                raise PipelineError(
+                    "当前终端不支持交互界面；请使用 convert --list 或 "
+                    "convert --key ITEM_KEY"
+                )
             service = ConversionService(vault, config, Zotero(config.zotero_url))
             if args.list:
                 for candidate in service.list_candidates():
@@ -161,6 +167,17 @@ def main(argv: list[str] | None = None) -> int:
                         f"{candidate.paper_folder.name}  ({candidate.detail})"
                     )
                 return 0
+            if args.keys is None:
+                print("正在检查论文转换状态……", flush=True)
+                candidates = service.list_candidates()
+                if not candidates:
+                    print("没有已完成入库的论文。")
+                    return 0
+                selected = run_conversion_picker(candidates)
+                if selected is None:
+                    print("已取消。", file=sys.stderr)
+                    return 130
+                args.keys = selected
             token = load_vault_token(vault)
             summary = service.convert_selected(args.keys, token)
             for message in summary.messages:

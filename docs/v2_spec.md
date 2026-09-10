@@ -12,7 +12,7 @@
 
 ## 2. 产品意图
 
-用户通过 Zotero Connector 收集论文，在自己的 Obsidian vault 中长期维护论文材料。Literature Pipeline 负责把一个 Zotero Collection 中尚未入库的论文一次性转移到 vault：保存无损元数据快照、建立本机 PDF 的零复制入口。PDF 转 Markdown 是与同步解耦的显式操作；只有用户选择具体论文 key 后，系统才把唯一 PDF 交给 MinerU。
+用户通过 Zotero Connector 收集论文，在自己的 Obsidian vault 中长期维护论文材料。Literature Pipeline 负责把一个 Zotero Collection 中尚未入库的论文一次性转移到 vault：保存无损元数据快照、建立本机 PDF 的零复制入口。PDF 转 Markdown 是与同步解耦的显式操作；只有用户在 TUI 中选择并确认具体论文，或明确传入论文 key 后，系统才把唯一 PDF 交给 MinerU。
 
 ```text
 Zotero 个人库中的指定 Collection
@@ -21,7 +21,7 @@ Zotero 个人库中的指定 Collection
    ├── zotero-item.json
    ├── meta.md
    └── <filename> [<attachment-key>].pdf -> Zotero managed PDF
-   ↓ convert --key <item-key>（显式选择）
+   ↓ convert（TUI 确认）或 convert --key <item-key>（显式选择）
    ├── full.md
    ├── images/
    └── temp/
@@ -40,7 +40,7 @@ Zotero 个人库中的指定 Collection
 5. 为本轮新论文建立所有本机 PDF child attachment 的符号链接。
 6. 提供 `link-pdfs`，为已有论文补建或修复受管理的 PDF 符号链接。
 7. 列出已入库论文的转换就绪状态，不消耗 MinerU 额度。
-8. 只转换用户通过 item key 明确选择的一个或多个已入库论文。
+8. 只转换用户通过 TUI 确认或 item key 明确选择的一个或多个已入库论文。
 9. 隔离单篇失败，继续处理批次中的其他论文，并用汇总及退出码如实报告结果。
 
 系统不得：
@@ -49,7 +49,7 @@ Zotero 个人库中的指定 Collection
 - 复制、下载、冻结或修改作为输入的 Zotero PDF。
 - 在多个 PDF 中猜测哪个是正文。
 - 更新、重排或覆盖已有 `meta.md` 与 `zotero-item.json`。
-- 由 `sync` 隐式触发任何 MinerU 请求，或在没有明确 key 的情况下批量转换。
+- 由 `sync` 隐式触发任何 MinerU 请求，或在没有经过 TUI 确认/明确 key 的情况下批量转换。
 - 保存转换状态表、建立后台队列或自动重试失败转换。
 - 自动覆盖或合并用户已有的 `full.md`、`images/`、`temp/` 或其他文件。
 - 自动生成精读笔记、合并重复论文或管理阅读状态。
@@ -57,11 +57,11 @@ Zotero 个人库中的指定 Collection
 
 ## 4. 运行环境与外部边界
 
-- 目标生产环境是 Zotero 所在的 Windows 电脑；Python 必须为 3.11 或更新版本。
+- 目标生产环境是 Zotero 所在的 Windows 或 Linux 电脑；Python 必须为 3.11 或更新版本。
 - Zotero API 地址必须是本机回环 HTTP 地址，不得包含凭据。
 - Zotero 访问只读；PDF 路径只通过 attachment child endpoint 与 `/file/view/url` 获得。
-- PDF 转换使用 MinerU 精准解析服务，会把论文 PDF 上传到外部服务。每次转换必须由用户显式提供论文 key。
-- MinerU SDK 与 dotenv 是 Literature Pipeline 的正式安装依赖，不使用工具目录专属虚拟环境。
+- PDF 转换使用 MinerU 精准解析服务，会把论文 PDF 上传到外部服务。每次转换必须由用户在 TUI 中选择并确认论文，或显式提供论文 key。
+- MinerU SDK、dotenv 与 prompt_toolkit 是 Literature Pipeline 的正式安装依赖，不使用工具目录专属虚拟环境。
 - Obsidian 仅用于浏览和维护文件；Pipeline 不依赖 Obsidian 进程。
 
 ## 5. 配置与 Token
@@ -91,7 +91,7 @@ timeout = 1800
 
 Token 不得写入 `config.toml`。`convert --key` 优先读取进程环境变量 `MINERU_TOKEN`；环境变量不存在时读取 `<vault>/.pipeline/.env`。真实环境变量存在但为空时必须报错，不得退回文件。Token 文件不得是符号链接，日志不得输出 Token。
 
-`sync` 与 `convert --list` 不得读取或要求 Token。`convert --key` 必须在查询论文附件或调用 MinerU 前验证 Token。`doctor` 可以报告 Token 是否就绪，但 Token 缺失不得令只使用同步功能的 vault 检查失败。
+`sync` 与 `convert --list` 不得读取或要求 Token。裸 `convert` 在浏览候选项或取消时不得读取 Token，只能在用户确认选择后读取。`convert --key` 必须在查询论文附件或调用 MinerU 前验证 Token。`doctor` 可以报告 Token 是否就绪，但 Token 缺失不得令只使用同步功能的 vault 检查失败。
 
 ## 6. 元数据与目录契约
 
@@ -141,9 +141,11 @@ PDF 符号链接名固定为 `<清理后的 filename stem> [<attachment-key>].pd
 
 ### 9.1 触发范围
 
-`sync` 与 `link-pdfs` 不得触发 MinerU。用户必须先运行 `convert --list` 查看所有已入库论文的状态；此操作不得要求 Token 或消耗 MinerU 额度。
+`sync` 与 `link-pdfs` 不得触发 MinerU。裸 `convert` 必须显示所有已入库论文的状态并允许交互选择；`convert --list` 提供等价的纯文本状态列表。候选查询不得要求 Token 或消耗 MinerU 额度。
 
-只有 `convert --key <item-key>` 可以触发转换。`--key` 可以重复，从而明确选择多个论文；未提供 `--key` 时不得转换，也不得提供隐式全选。选择范围包括所有已完成入库的历史或新论文。
+裸 `convert` 只在交互终端中启动 TUI，初始不得选择任何论文；只有用户勾选一个或多个 `Ready` 项并通过额度确认后才可触发转换。`convert --key <item-key>` 是非交互入口，`--key` 可以重复并直接构成转换授权。两种入口都不得提供隐式全选，选择范围包括所有已完成入库的历史或新论文。stdin 或 stdout 不是终端时，裸 `convert` 必须在访问 Zotero 和读取 Token 前报错，提示改用 `--list` 或 `--key`。
+
+TUI 必须显示全部候选状态，只有 `Ready` 可选；支持键盘移动、当前项切换、当前过滤结果中的 Ready 全选、搜索、详情和二次确认。搜索至少匹配 item key、论文目录名、状态和详情。用户取消返回 130。确认退出 TUI 后使用普通前台日志执行转换，不在 TUI 中运行远程任务。
 
 候选状态至少包括：
 
@@ -156,7 +158,7 @@ PDF 符号链接名固定为 `<清理后的 filename stem> [<attachment-key>].pd
 
 每个被选择的 key 必须对应唯一完成论文目录，并且 Zotero 当前返回的有效 PDF child attachment 总数恰好为一个。程序必须读取当前附件 file URI，并确认论文目录中恰好有一个按 attachment key 管理、指向该当前文件的 PDF 符号链接。`convert` 不得自行创建或修复链接；不满足时应提示用户先处理附件或运行 `link-pdfs`。
 
-多个 key 按命令行选择顺序串行、前台执行。程序只在建立本地索引时短暂持有 vault 主写锁；远程转换不得持有主锁。每个转换使用按 item key 区分的细粒度 OS 文件锁，锁只表示活跃进程，不是持久状态。
+多个 key 在 `--key` 模式下按命令行顺序、在 TUI 模式下按界面列表顺序串行前台执行。程序只在建立本地索引时短暂持有 vault 主写锁；远程转换不得持有主锁。每个转换使用按 item key 区分的细粒度 OS 文件锁，锁只表示活跃进程，不是持久状态。
 
 ### 9.2 额度保护预检
 
@@ -203,11 +205,11 @@ Pipeline 不建立转换结果子目录，而是把暂存结果的根层条目�
 
 MinerU 请求、超时、结果验证、名称冲突或文件发布失败均不得修改元数据与 PDF 链接，也不得阻止同一命令中后续选择的论文。出现任一转换失败时，`convert` 必须返回非零；转换结果不得影响 `sync` 的退出码。
 
-系统不自动重试，也不保存转换状态。用户再次明确传入同一 key 才构成新的授权尝试；每次尝试前都必须重新执行额度保护预检。若 `full.md` 已发布，后续选择必须在 MinerU 调用前跳过。
+系统不自动重试，也不保存转换状态。用户再次通过 TUI 选择并确认同一论文，或明确传入同一 key，才构成新的授权尝试；每次尝试前都必须重新执行额度保护预检。若 `full.md` 已发布，后续选择必须在 MinerU 调用前跳过。
 
 ## 10. CLI 与汇总
 
-所有需要 vault 的命令都必须接受可选的 `--vault PATH`，显式路径优先。`init` 省略该参数时必须使用当前目录，不执行向上发现；`doctor`、`sync`、`link-pdfs` 与 `convert` 省略该参数时，必须从当前目录逐级向文件系统根目录搜索，选择最近一个含 `.pipeline/config.toml` 路径的目录。仅有 `.pipeline` 目录不构成标志；最近标志损坏时必须报告该 vault 的配置错误，不得静默回退到外层 vault。完全找不到标志时，必须在访问 Zotero、读取 Token 或修改文件前报错。自动发现不得改变 `convert` 对 `--list` 或显式 `--key` 的要求。
+所有需要 vault 的命令都必须接受可选的 `--vault PATH`，显式路径优先。`init` 省略该参数时必须使用当前目录，不执行向上发现；`doctor`、`sync`、`link-pdfs` 与 `convert` 省略该参数时，必须从当前目录逐级向文件系统根目录搜索，选择最近一个含 `.pipeline/config.toml` 路径的目录。仅有 `.pipeline` 目录不构成标志；最近标志损坏时必须报告该 vault 的配置错误，不得静默回退到外层 vault。完全找不到标志时，必须在访问 Zotero、读取 Token 或修改文件前报错。自动发现不得改变 `convert` 的 TUI、`--list` 或显式 `--key` 模式。
 
 CLI 必须提供：
 
@@ -216,7 +218,8 @@ CLI 必须提供：
 - `doctor`：检查配置、vault 写入、PDF 符号链接和 Zotero；可以提示 MinerU Token 是否就绪，但 Token 缺失不令检查失败。
 - `sync`：一次性导入新论文、链接 PDF 并列出本轮新增 key，绝不调用 MinerU。
 - `link-pdfs`：为已有论文补建或修复 PDF 符号链接，不触发转换。
-- `convert --list`：列出转换状态，不要求 Token。
+- `convert`：在交互终端中显示候选论文 TUI，确认选择后转换。
+- `convert --list`：以纯文本列出转换状态，不要求 Token。
 - `convert --key KEY [--key KEY ...]`：转换明确选择的论文，不提供隐式全选。
 
 `sync` 汇总必须至少包含：
@@ -247,8 +250,8 @@ pdf_linked pdf_missing pdf_failed
 4. sidecar-only 中断可从原快照恢复，重复 key 与路径冲突不覆盖。
 5. 所有 PDF attachment 都建立符号链接；缺失和冲突不回滚元数据。
 6. `sync` 在任何配置下都不读取 Token、不调用 MinerU，并列出本轮新增 key。
-7. `convert --list` 无 Token 时仍可列出 Ready、Converted、No PDF、Multiple、Unavailable 和 Conflict 状态。
-8. `convert` 没有明确 key 时不能运行；一个或多个明确 key 可选择历史或新论文。
+7. `convert --list` 无 Token 时仍可列出 Ready、Converted、No PDF、Multiple、Unavailable 和 Conflict 状态；TUI 浏览和取消同样不要求 Token。
+8. 裸 `convert` 在交互终端中初始为空选择，只有选择 Ready 项并确认后才转换；非交互终端必须拒绝。一个或多个明确 key 仍可选择历史或新论文。
 9. 无 PDF、多 PDF、链接无效、输出冲突或重复 key 在 MinerU 客户端创建前失败。
 10. 普通 `full.md` 已存在时安全跳过，不重复消耗额度；只有再次明确选择才能重试未完成论文。
 11. MinerU 返回的根层 PDF 被删除，额外 Markdown 与辅助文件进入 `temp/`，且缺少 `full.md` 时不发布。
