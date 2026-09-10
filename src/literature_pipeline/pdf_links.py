@@ -40,6 +40,12 @@ class PdfAttachment:
     filename: str
 
 
+@dataclass(frozen=True)
+class AvailablePdf:
+    attachment_key: str
+    path: Path
+
+
 def pdf_link_name(filename: str, attachment_key: str) -> str:
     if not isinstance(filename, str):
         raise PipelineError("Zotero attachment.filename 必须是字符串")
@@ -207,6 +213,46 @@ class PdfLinker:
                 summary.failed += 1
                 summary.messages.append(f"论文 {parent_key} 的附件 {attachment.key} 失败：{error}")
         return summary
+
+    def conversion_pdf(self, folder: Path, parent_key: str) -> tuple[int, AvailablePdf | None]:
+        """Inspect, but never repair, the unique current PDF link for conversion."""
+        if folder.is_symlink() or not folder.is_dir():
+            raise PipelineError(f"论文目录不是普通目录：{folder}")
+        children = self.zotero.children(parent_key)
+        if not isinstance(children, list):
+            raise PipelineError("Zotero children 响应不是列表")
+        attachments: list[PdfAttachment] = []
+        for position, child in enumerate(children, start=1):
+            try:
+                attachment = _attachment(child, parent_key)
+            except (PipelineError, OSError, UnicodeError, ValueError, TypeError) as error:
+                raise PipelineError(
+                    f"论文 {parent_key} 的第 {position} 个附件无效：{error}"
+                ) from error
+            if attachment is not None:
+                attachments.append(attachment)
+        if len(attachments) != 1:
+            return len(attachments), None
+
+        attachment = attachments[0]
+        target = file_uri_path(self.zotero.attachment_file_url(attachment.key))
+        suffix = f" [{attachment.key}].pdf".casefold()
+        try:
+            managed = [
+                path
+                for path in folder.iterdir()
+                if path.is_symlink() and path.name.casefold().endswith(suffix)
+            ]
+        except OSError as error:
+            raise PipelineError(f"无法扫描论文目录中的 PDF 链接：{folder}") from error
+        if len(managed) != 1:
+            raise PipelineError(
+                f"需要恰好一个 attachment {attachment.key} 的 PDF 符号链接，实际为 {len(managed)} 个"
+            )
+        link = managed[0]
+        if _normalized(_link_target(link)) != _normalized(target):
+            raise PipelineError(f"PDF 符号链接不是 Zotero 当前附件目标：{link}")
+        return 1, AvailablePdf(attachment.key, link)
 
     def link_existing(self, vault: Path) -> PdfLinkSummary:
         index = index_existing(vault)

@@ -198,12 +198,24 @@ def atomic_create(path: Path, content: str) -> None:
 class VaultLock:
     """OS-managed writer lock, released automatically when the process exits."""
 
-    def __init__(self, vault: Path):
-        self.path = vault / ".pipeline" / "writer.lock"
+    def __init__(
+        self,
+        vault: Path,
+        *,
+        relative_path: Path = Path("writer.lock"),
+        busy_message: str = "此 vault 已有 Literature Pipeline 写入进程",
+    ):
+        self.pipeline_directory = vault / ".pipeline"
+        self.path = vault / ".pipeline" / relative_path
+        self.busy_message = busy_message
         self.handle = None
 
     def __enter__(self):
         directory = self.path.parent
+        if self.pipeline_directory.exists() and (
+            self.pipeline_directory.is_symlink() or not self.pipeline_directory.is_dir()
+        ):
+            raise PipelineError(f".pipeline 不是可写入的普通目录：{self.pipeline_directory}")
         if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
             raise PipelineError(f".pipeline 不是可写入的普通目录：{directory}")
         directory.mkdir(parents=True, exist_ok=True)
@@ -224,9 +236,20 @@ class VaultLock:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             self.handle.close()
-            raise PipelineError("此 vault 已有 Literature Pipeline 写入进程") from error
+            raise PipelineError(self.busy_message) from error
         return self
 
     def __exit__(self, *_):
         if self.handle:
             self.handle.close()
+
+
+class PdfConversionLock(VaultLock):
+    """Serialize conversion of one Zotero item without locking the whole vault."""
+
+    def __init__(self, vault: Path, item_key: str):
+        super().__init__(
+            vault,
+            relative_path=Path("pdf2md-locks") / f"{item_key}.lock",
+            busy_message=f"论文 {item_key} 已有 PDF 转换进程",
+        )

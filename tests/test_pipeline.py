@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 import yaml
 
-from literature_pipeline.cli import main
+from literature_pipeline.cli import _vault, main
+from literature_pipeline.conversion import ConversionService
 from literature_pipeline.files import (
     PipelineError,
     VaultLock,
@@ -22,8 +23,22 @@ from literature_pipeline.files import (
     render_zotero_json,
 )
 from literature_pipeline.ingest import Importer
-from literature_pipeline.library import Config, index_existing, initialize, load_config
+from literature_pipeline.library import (
+    Config,
+    Pdf2MdConfig,
+    index_existing,
+    initialize,
+    load_config,
+)
 from literature_pipeline.pdf_links import PdfLinker, file_uri_path, pdf_link_name
+from literature_pipeline.pdf2md import (
+    ConversionError,
+    ConversionOptions,
+    convert_pdf,
+    convert_pdf_into_paper,
+    load_vault_token,
+    organize_result,
+)
 from literature_pipeline.zotero import Zotero, key, validate_url
 
 
@@ -97,6 +112,42 @@ def pdf_attachment(
         "filename": filename,
     }
     return {"key": attachment_key, "version": 1, "data": data}
+
+
+class FakeMinerUResult:
+    state = "done"
+    error = None
+
+    def __init__(self, *, include_full: bool = True):
+        self.include_full = include_full
+
+    def save_all(self, directory: str) -> None:
+        root = Path(directory)
+        if self.include_full:
+            (root / "full.md").write_text("# Converted\n", encoding="utf-8")
+        (root / "content_list.md").write_text("auxiliary", encoding="utf-8")
+        (root / "paper_origin.pdf").write_bytes(b"%PDF-returned-copy")
+        (root / "layout.json").write_text("{}", encoding="utf-8")
+        images = root / "images"
+        images.mkdir()
+        (images / "figure.png").write_bytes(b"png")
+
+
+class FakeMinerUClient:
+    def __init__(self, token: str, result: FakeMinerUResult | None = None):
+        self.token = token
+        self.result = result or FakeMinerUResult()
+        self.calls: list[tuple[str, dict]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def extract(self, pdf: str, **options):
+        self.calls.append((pdf, options))
+        return self.result
 
 
 class ImportTests(unittest.TestCase):
@@ -557,8 +608,9 @@ class ConfigAndFileTests(unittest.TestCase):
         self.assertEqual(existing.read_text(encoding="utf-8"), "mine")
         self.assertEqual(load_config(self.vault), Config("COLLECT1", "http://localhost:23119/api/"))
         self.assertEqual(
-            set(load_config(self.vault).__dict__), {"collection", "zotero_url"}
+            set(load_config(self.vault).__dict__), {"collection", "zotero_url", "pdf2md"}
         )
+        self.assertEqual(load_config(self.vault).pdf2md, Pdf2MdConfig())
         self.assertFalse((self.vault / "papers").exists())
 
     def test_init_never_overwrites_config(self):
@@ -602,8 +654,392 @@ class ConfigAndFileTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(PipelineError):
                 validate_url(value)
 
+    def test_pdf2md_config_is_written_and_validated(self):
+        initialize(
+            self.vault,
+            "COLLECT1",
+            "http://localhost:23119/api/",
+            pdf2md_model="pipeline",
+            pdf2md_language="ch",
+            pdf2md_ocr=True,
+            pdf2md_timeout=3600,
+        )
+        self.assertEqual(
+            load_config(self.vault).pdf2md,
+            Pdf2MdConfig("pipeline", "ch", True, 3600),
+        )
+
+    def test_deprecated_enabled_is_accepted_but_ignored(self):
+        config = self.vault / ".pipeline" / "config.toml"
+        config.parent.mkdir()
+        config.write_text(
+            'collection = "COLLECT1"\n'
+            'zotero_url = "http://localhost:23119/api/"\n'
+            "[pdf2md]\n"
+            "enabled = true\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(load_config(self.vault).pdf2md, Pdf2MdConfig())
+
+    def test_pdf2md_config_rejects_unknown_or_invalid_values(self):
+        config = self.vault / ".pipeline" / "config.toml"
+        config.parent.mkdir()
+        base = 'collection = "COLLECT1"\nzotero_url = "http://localhost:23119/api/"\n'
+        for table in (
+            "[pdf2md]\nenabled = true\nunknown = 1\n",
+            "[pdf2md]\nenabled = \"yes\"\n",
+            "[pdf2md]\ntimeout = 0\n",
+        ):
+            with self.subTest(table=table):
+                config.write_text(base + table, encoding="utf-8")
+                with self.assertRaises(PipelineError):
+                    load_config(self.vault)
+
+
+class Pdf2MdTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pdf = self.root / "source.pdf"
+        self.pdf.write_bytes(b"%PDF-input")
+
+    def options(self, output_root: Path | None = None) -> ConversionOptions:
+        return ConversionOptions(
+            pdf=self.pdf,
+            output_root=output_root or self.root / "results",
+            token="secret",
+            model="pipeline",
+            language="ch",
+            ocr=True,
+            timeout=45,
+        )
+
+    def test_organize_removes_returned_pdf_and_requires_full_markdown(self):
+        result = self.root / "result"
+        result.mkdir()
+        FakeMinerUResult().save_all(str(result))
+        organize_result(result)
+        self.assertTrue((result / "full.md").is_file())
+        self.assertFalse((result / "paper_origin.pdf").exists())
+        self.assertTrue((result / "images" / "figure.png").is_file())
+        self.assertTrue((result / "temp" / "content_list.md").is_file())
+        self.assertTrue((result / "temp" / "layout.json").is_file())
+
+        missing = self.root / "missing"
+        missing.mkdir()
+        FakeMinerUResult(include_full=False).save_all(str(missing))
+        with self.assertRaises(ConversionError):
+            organize_result(missing)
+
+    def test_standalone_conversion_keeps_result_directory_but_no_pdf_copy(self):
+        client = FakeMinerUClient("secret")
+        destination = convert_pdf(self.options(), client_factory=lambda token: client)
+        self.assertEqual(destination, self.root / "results" / "source")
+        self.assertTrue((destination / "full.md").is_file())
+        self.assertFalse(any(destination.glob("*.pdf")))
+        self.assertEqual(client.token, "secret")
+        self.assertEqual(client.calls[0][1]["language"], "ch")
+        self.assertTrue(client.calls[0][1]["ocr"])
+
+    def test_pipeline_conversion_publishes_directly_and_preserves_input(self):
+        paper = self.root / "paper"
+        paper.mkdir()
+        (paper / "meta.md").write_text("metadata", encoding="utf-8")
+        convert_pdf_into_paper(
+            self.options(paper),
+            paper,
+            client_factory=lambda token: FakeMinerUClient(token),
+        )
+        self.assertEqual((paper / "full.md").read_text(encoding="utf-8"), "# Converted\n")
+        self.assertTrue((paper / "images" / "figure.png").is_file())
+        self.assertTrue((paper / "temp" / "content_list.md").is_file())
+        self.assertTrue((paper / "temp" / "layout.json").is_file())
+        self.assertFalse(any(paper.glob("*_origin.pdf")))
+        self.assertEqual(self.pdf.read_bytes(), b"%PDF-input")
+        self.assertEqual((paper / "meta.md").read_text(encoding="utf-8"), "metadata")
+
+    def test_pipeline_conversion_conflict_publishes_nothing(self):
+        paper = self.root / "paper"
+        paper.mkdir()
+        (paper / "full.md").write_text("mine", encoding="utf-8")
+        factory_calls = []
+
+        def factory(token):
+            factory_calls.append(token)
+            return FakeMinerUClient(token)
+
+        with self.assertRaises(ConversionError):
+            convert_pdf_into_paper(
+                self.options(paper),
+                paper,
+                client_factory=factory,
+            )
+        self.assertEqual(factory_calls, [])
+        self.assertEqual((paper / "full.md").read_text(encoding="utf-8"), "mine")
+        self.assertFalse((paper / "images").exists())
+        self.assertFalse((paper / "temp").exists())
+
+    def test_pipeline_conversion_rolls_back_an_ordinary_publish_error(self):
+        paper = self.root / "paper"
+        paper.mkdir()
+        with (
+            patch("literature_pipeline.pdf2md.os.link", side_effect=OSError("disk error")),
+            self.assertRaises(ConversionError),
+        ):
+            convert_pdf_into_paper(
+                self.options(paper),
+                paper,
+                client_factory=lambda token: FakeMinerUClient(token),
+            )
+        self.assertFalse((paper / "full.md").exists())
+        self.assertFalse((paper / "images").exists())
+        self.assertFalse((paper / "temp").exists())
+
+    def test_vault_token_prefers_environment_then_vault_env_file(self):
+        vault = self.root / "vault"
+        env_file = vault / ".pipeline" / ".env"
+        env_file.parent.mkdir(parents=True)
+        env_file.write_text("MINERU_TOKEN=file-token\n", encoding="utf-8")
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(load_vault_token(vault), "file-token")
+        with patch.dict("os.environ", {"MINERU_TOKEN": "real-token"}, clear=True):
+            self.assertEqual(load_vault_token(vault), "real-token")
+        with patch.dict("os.environ", {}, clear=True):
+            env_file.unlink()
+            with self.assertRaises(ConversionError):
+                load_vault_token(vault)
+
+
+class ConversionServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+        self.config = Config("COLLECT1", "http://localhost:23119/api/")
+
+    def source(self, name: str = "source.pdf") -> Path:
+        path = self.root / name
+        path.write_bytes(b"%PDF")
+        return path
+
+    def test_historical_ready_paper_can_be_selected_explicitly(self):
+        source = self.source()
+        zotero = FakeZotero(
+            [item()],
+            {"PAPER001": [pdf_attachment("PDFKEY01")]},
+            {"PDFKEY01": source.as_uri()},
+        )
+        Importer(self.vault, self.config, zotero).sync()
+        service = ConversionService(self.vault, self.config, zotero)
+        self.assertEqual(service.list_candidates()[0].status, "Ready")
+        observed = []
+
+        def convert(_options, folder):
+            with VaultLock(self.vault):
+                observed.append("main lock released")
+            (folder / "full.md").write_text("# converted\n", encoding="utf-8")
+
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper", side_effect=convert):
+            summary = service.convert_selected(["PAPER001"], "token")
+        self.assertEqual(summary.converted, 1)
+        self.assertEqual(summary.failed, 0)
+        self.assertEqual(observed, ["main lock released"])
+
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
+            repeated = service.convert_selected(["PAPER001"], "token")
+        self.assertEqual(repeated.skipped, 1)
+        converter.assert_not_called()
+
+    def test_list_reports_no_pdf_multiple_converted_and_ready(self):
+        entries = [item(f"PAPER00{number}") for number in range(1, 5)]
+        first, second = self.source("first.pdf"), self.source("second.pdf")
+        ready = self.source("ready.pdf")
+        converted = self.source("converted.pdf")
+        zotero = FakeZotero(
+            entries,
+            {
+                "PAPER001": [],
+                "PAPER002": [
+                    pdf_attachment("PDFKEY01", "PAPER002"),
+                    pdf_attachment("PDFKEY02", "PAPER002"),
+                ],
+                "PAPER003": [pdf_attachment("PDFKEY03", "PAPER003")],
+                "PAPER004": [pdf_attachment("PDFKEY04", "PAPER004")],
+            },
+            {
+                "PDFKEY01": first.as_uri(),
+                "PDFKEY02": second.as_uri(),
+                "PDFKEY03": converted.as_uri(),
+                "PDFKEY04": ready.as_uri(),
+            },
+        )
+        Importer(self.vault, self.config, zotero).sync()
+        (item_folder(self.vault, entries[2]) / "full.md").write_text(
+            "converted", encoding="utf-8"
+        )
+        statuses = {
+            candidate.item_key: candidate.status
+            for candidate in ConversionService(self.vault, self.config, zotero).list_candidates()
+        }
+        self.assertEqual(
+            statuses,
+            {
+                "PAPER001": "No PDF",
+                "PAPER002": "Multiple",
+                "PAPER003": "Converted",
+                "PAPER004": "Ready",
+            },
+        )
+
+    def test_multiple_pdf_never_calls_converter(self):
+        first, second = self.source("first.pdf"), self.source("second.pdf")
+        multiple_zotero = FakeZotero(
+            [item()],
+            {"PAPER001": [pdf_attachment("PDFKEY01"), pdf_attachment("PDFKEY02")]},
+            {"PDFKEY01": first.as_uri(), "PDFKEY02": second.as_uri()},
+        )
+        Importer(self.vault, self.config, multiple_zotero).sync()
+        service = ConversionService(self.vault, self.config, multiple_zotero)
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
+            summary = service.convert_selected(["PAPER001"], "token")
+        self.assertEqual(summary.failed, 1)
+        converter.assert_not_called()
+
+    def test_unavailable_pdf_is_listed_without_calling_converter(self):
+        missing = self.root / "missing.pdf"
+        zotero = FakeZotero(
+            [item()],
+            {"PAPER001": [pdf_attachment("PDFKEY01")]},
+            {"PDFKEY01": missing.as_uri()},
+        )
+        Importer(self.vault, self.config, zotero).sync()
+        service = ConversionService(self.vault, self.config, zotero)
+        self.assertEqual(service.list_candidates()[0].status, "Unavailable")
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
+            summary = service.convert_selected(["PAPER001"], "token")
+        self.assertEqual(summary.failed, 1)
+        converter.assert_not_called()
+
+    def test_selected_conversion_failure_does_not_block_later_key(self):
+        entries = [item("PAPER001"), item("PAPER002")]
+        first, second = self.source("first.pdf"), self.source("second.pdf")
+        zotero = FakeZotero(
+            entries,
+            {
+                "PAPER001": [pdf_attachment("PDFKEY01", "PAPER001")],
+                "PAPER002": [pdf_attachment("PDFKEY02", "PAPER002")],
+            },
+            {"PDFKEY01": first.as_uri(), "PDFKEY02": second.as_uri()},
+        )
+        Importer(self.vault, self.config, zotero).sync()
+        calls = []
+
+        def convert(_options, folder):
+            calls.append(folder.name)
+            if len(calls) == 1:
+                raise ConversionError("first failed")
+
+        service = ConversionService(self.vault, self.config, zotero)
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper", side_effect=convert):
+            summary = service.convert_selected(["PAPER001", "PAPER002"], "token")
+        self.assertEqual(summary.converted, 1)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(len(calls), 2)
+
 
 class AdapterAndCliTests(unittest.TestCase):
+    def test_vault_is_discovered_from_a_deep_paper_subdirectory(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            working_directory = vault / "paper" / "images"
+            working_directory.mkdir(parents=True)
+            with patch("literature_pipeline.cli.Path.cwd", return_value=working_directory):
+                self.assertEqual(_vault(None), vault.resolve())
+
+    def test_vault_discovery_uses_nearest_marker_and_explicit_value_wins(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = Path(root) / "outer"
+            inner = outer / "paper" / "nested-vault"
+            explicit = Path(root) / "explicit"
+            initialize(outer, "COLLECT1", "http://localhost:23119/api/")
+            initialize(inner, "COLLECT2", "http://localhost:23119/api/")
+            working_directory = inner / "paper" / "temp"
+            working_directory.mkdir(parents=True)
+            with patch("literature_pipeline.cli.Path.cwd", return_value=working_directory):
+                self.assertEqual(_vault(None), inner.resolve())
+                self.assertEqual(_vault(explicit), explicit.resolve())
+
+    def test_init_without_vault_uses_current_directory_not_parent_vault(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root) / "parent-vault"
+            initialize(parent, "COLLECT1", "http://localhost:23119/api/")
+            current = parent / "new-vault"
+            current.mkdir()
+            with (
+                patch("literature_pipeline.cli.Path.cwd", return_value=current),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = main(["init", "--collection", "COLLECT2"])
+            self.assertEqual(result, 0)
+            self.assertEqual(load_config(current).collection, "COLLECT2")
+
+    def test_cli_sync_discovers_vault_without_argument(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            working_directory = vault / "existing paper" / "images"
+            working_directory.mkdir(parents=True)
+            with (
+                patch("literature_pipeline.cli.Path.cwd", return_value=working_directory),
+                patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = main(["sync"])
+            self.assertEqual(result, 0)
+            self.assertTrue((item_folder(vault) / "meta.md").is_file())
+
+    def test_missing_vault_marker_fails_before_zotero_access(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = io.StringIO()
+            with (
+                patch("literature_pipeline.cli.Path.cwd", return_value=Path(root)),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be accessed"),
+                ),
+                redirect_stderr(output),
+            ):
+                result = main(["sync"])
+            self.assertEqual(result, 1)
+            self.assertIn(".pipeline/config.toml", output.getvalue())
+
+    def test_invalid_nearest_marker_does_not_fall_back_to_outer_vault(self):
+        with tempfile.TemporaryDirectory() as root:
+            outer = Path(root) / "outer"
+            initialize(outer, "COLLECT1", "http://localhost:23119/api/")
+            inner = outer / "paper"
+            marker = inner / ".pipeline" / "config.toml"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("invalid toml =", encoding="utf-8")
+            working_directory = inner / "images"
+            working_directory.mkdir()
+            output = io.StringIO()
+            with (
+                patch("literature_pipeline.cli.Path.cwd", return_value=working_directory),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be accessed"),
+                ),
+                redirect_stderr(output),
+            ):
+                result = main(["sync"])
+            self.assertEqual(result, 1)
+            self.assertIn(str(marker), output.getvalue())
+
     def test_list_paginates_and_rejects_inconsistent_snapshot(self):
         api = Zotero()
 
@@ -625,6 +1061,88 @@ class AdapterAndCliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("created=1 skipped=0 conflicts=0 failed=0", output.getvalue())
             self.assertIn("pdf_linked=0 pdf_missing=1 pdf_failed=0", output.getvalue())
+            self.assertIn("本轮新增 key：PAPER001", output.getvalue())
+
+    def test_cli_sync_never_requires_mineru_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(["sync", "--vault", str(vault)]), 0)
+            self.assertEqual(len(list(vault.glob("*/meta.md"))), 1)
+
+    def test_cli_convert_requires_token_before_zotero_requests(self):
+        with tempfile.TemporaryDirectory() as root:
+            vault = Path(root) / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(FakeZotero, "children", side_effect=AssertionError("must not run")),
+                patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = main(["convert", "--vault", str(vault), "--key", "PAPER001"])
+            self.assertEqual(result, 1)
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlinks unavailable")
+    def test_cli_convert_selected_releases_main_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            vault = root_path / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            source = root_path / "source.pdf"
+            source.write_bytes(b"%PDF")
+            fake_zotero = FakeZotero(
+                [item()],
+                {"PAPER001": [pdf_attachment("PDFKEY01")]},
+                {"PDFKEY01": source.as_uri()},
+            )
+            Importer(vault, load_config(vault), fake_zotero).sync()
+            observed = []
+
+            def convert(_options, _folder):
+                with VaultLock(vault):
+                    observed.append("main lock released")
+
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"MINERU_TOKEN": "token"}, clear=True),
+                patch("literature_pipeline.cli.Zotero", return_value=fake_zotero),
+                patch("literature_pipeline.conversion.convert_pdf_into_paper", side_effect=convert),
+                redirect_stdout(output),
+            ):
+                result = main(["convert", "--vault", str(vault), "--key", "PAPER001"])
+            self.assertEqual(result, 0)
+            self.assertEqual(observed, ["main lock released"])
+            self.assertIn("selected=1 converted=1 skipped=0 failed=0", output.getvalue())
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlinks unavailable")
+    def test_cli_convert_list_needs_no_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            vault = root_path / "vault"
+            initialize(vault, "COLLECT1", "http://localhost:23119/api/")
+            source = root_path / "source.pdf"
+            source.write_bytes(b"%PDF")
+            fake = FakeZotero(
+                [item()],
+                {"PAPER001": [pdf_attachment("PDFKEY01")]},
+                {"PDFKEY01": source.as_uri()},
+            )
+            Importer(vault, load_config(vault), fake).sync()
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("literature_pipeline.cli.Zotero", return_value=fake),
+                redirect_stdout(output),
+            ):
+                result = main(["convert", "--vault", str(vault), "--list"])
+            self.assertEqual(result, 0)
+            self.assertIn("PAPER001  Ready", output.getvalue())
 
     @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlinks unavailable")
     def test_cli_link_pdfs_reports_summary(self):
@@ -664,7 +1182,7 @@ class AdapterAndCliTests(unittest.TestCase):
             self.assertIn("通过：PDF 符号链接", output.getvalue())
 
     def test_cli_has_no_removed_commands(self):
-        for command in ("watch", "status", "convert", "select-pdf"):
+        for command in ("watch", "status", "select-pdf"):
             with self.subTest(command=command), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main([command])
 

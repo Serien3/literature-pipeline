@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .files import PipelineError, atomic_create, read_meta, read_zotero_json
@@ -12,9 +12,18 @@ from .zotero import key, validate_url
 
 
 @dataclass(frozen=True)
+class Pdf2MdConfig:
+    model: str = "vlm"
+    language: str = "en"
+    ocr: bool = False
+    timeout: int = 1800
+
+
+@dataclass(frozen=True)
 class Config:
     collection: str
     zotero_url: str
+    pdf2md: Pdf2MdConfig = field(default_factory=Pdf2MdConfig)
 
 
 @dataclass(frozen=True)
@@ -36,14 +45,38 @@ class ExistingIndex:
         return declarations
 
 
-def initialize(vault: Path, collection: str, zotero_url: str) -> None:
+def initialize(
+    vault: Path,
+    collection: str,
+    zotero_url: str,
+    *,
+    pdf2md_model: str = "vlm",
+    pdf2md_language: str = "en",
+    pdf2md_ocr: bool = False,
+    pdf2md_timeout: int = 1800,
+) -> None:
     collection = key(collection)
     zotero_url = validate_url(zotero_url)
     vault.mkdir(parents=True, exist_ok=True)
     if vault.is_symlink() or not vault.is_dir():
         raise PipelineError(f"vault 不是普通目录：{vault}")
     path = vault / ".pipeline" / "config.toml"
+    pdf2md = _pdf2md_config(
+        {
+            "model": pdf2md_model,
+            "language": pdf2md_language,
+            "ocr": pdf2md_ocr,
+            "timeout": pdf2md_timeout,
+        }
+    )
     content = f"collection = {json.dumps(collection)}\nzotero_url = {json.dumps(zotero_url)}\n"
+    content += (
+        "\n[pdf2md]\n"
+        f"model = {json.dumps(pdf2md.model)}\n"
+        f"language = {json.dumps(pdf2md.language)}\n"
+        f"ocr = {str(pdf2md.ocr).lower()}\n"
+        f"timeout = {pdf2md.timeout}\n"
+    )
     try:
         atomic_create(path, content)
     except FileExistsError as error:
@@ -56,15 +89,53 @@ def load_config(vault: Path) -> Config:
         config = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise PipelineError(f"无法读取配置，请先 init：{path}") from error
-    expected = {"collection", "zotero_url"}
-    if set(config) != expected:
-        raise PipelineError("配置只能包含 collection 和 zotero_url")
+    expected = {"collection", "zotero_url", "pdf2md"}
+    if not {"collection", "zotero_url"}.issubset(config) or not set(config) <= expected:
+        raise PipelineError("配置必须包含 collection、zotero_url，且只能额外包含 [pdf2md]")
     collection = key(config.get("collection", ""))
     zotero_url = config.get("zotero_url")
     if not isinstance(zotero_url, str):
         raise PipelineError("zotero_url 必须是字符串")
     validate_url(zotero_url)
-    return Config(collection=collection, zotero_url=zotero_url)
+    raw_pdf2md = config.get("pdf2md", {})
+    if not isinstance(raw_pdf2md, dict):
+        raise PipelineError("pdf2md 必须是 TOML 表")
+    return Config(
+        collection=collection,
+        zotero_url=zotero_url,
+        pdf2md=_pdf2md_config(raw_pdf2md),
+    )
+
+
+def _pdf2md_config(raw: dict) -> Pdf2MdConfig:
+    # ``enabled`` existed briefly during v2 development. Accept and ignore it
+    # so a generated config cannot accidentally re-couple conversion to sync.
+    allowed = {"enabled", "model", "language", "ocr", "timeout"}
+    if not set(raw) <= allowed:
+        unknown = "、".join(sorted(set(raw) - allowed))
+        raise PipelineError(f"pdf2md 包含未知配置：{unknown}")
+
+    deprecated_enabled = raw.get("enabled", False)
+    model = raw.get("model", "vlm")
+    language = raw.get("language", "en")
+    ocr = raw.get("ocr", False)
+    timeout = raw.get("timeout", 1800)
+    if not isinstance(deprecated_enabled, bool):
+        raise PipelineError("已弃用的 pdf2md.enabled 必须是布尔值")
+    if model not in {"vlm", "pipeline"}:
+        raise PipelineError("pdf2md.model 必须是 vlm 或 pipeline")
+    if not isinstance(language, str) or not language.strip():
+        raise PipelineError("pdf2md.language 必须是非空字符串")
+    if not isinstance(ocr, bool):
+        raise PipelineError("pdf2md.ocr 必须是布尔值")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise PipelineError("pdf2md.timeout 必须是大于 0 的整数")
+    return Pdf2MdConfig(
+        model=model,
+        language=language.strip(),
+        ocr=ocr,
+        timeout=timeout,
+    )
 
 
 def index_existing(vault: Path) -> ExistingIndex:

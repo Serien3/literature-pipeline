@@ -1,4 +1,4 @@
-"""Command-line interface for one-shot Zotero metadata import."""
+"""Command-line interface for one-shot Zotero paper import."""
 
 from __future__ import annotations
 
@@ -8,9 +8,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .conversion import ConversionService
 from .files import PipelineError, VaultLock
 from .ingest import Importer
 from .library import initialize, load_config
+from .pdf2md import load_vault_token
 from .pdf_links import PdfLinker
 from .zotero import Zotero
 
@@ -26,22 +28,56 @@ def parser() -> argparse.ArgumentParser:
     collections.add_argument("--zotero-url", default=DEFAULT_ZOTERO_URL)
 
     init = commands.add_parser("init", help="在已有或新建 vault 中初始化最小配置")
-    init.add_argument("--vault", type=Path, required=True)
+    init.add_argument("--vault", type=Path, help="vault 路径（默认：当前目录）")
     init.add_argument("--collection", required=True, help="Zotero Collection 的 8 位 key")
     init.add_argument("--zotero-url", default=DEFAULT_ZOTERO_URL)
+    init.add_argument("--pdf2md-model", choices=("vlm", "pipeline"), default="vlm")
+    init.add_argument("--pdf2md-language", default="en")
+    init.add_argument("--pdf2md-ocr", action="store_true")
+    init.add_argument("--pdf2md-timeout", type=int, default=1800)
 
     doctor = commands.add_parser("doctor", help="检查配置、vault 和 Zotero 连接")
-    doctor.add_argument("--vault", type=Path, required=True)
+    doctor.add_argument("--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）")
 
     sync = commands.add_parser("sync", help="导入尚未入库的 Zotero 元数据")
-    sync.add_argument("--vault", type=Path, required=True)
+    sync.add_argument("--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）")
     link_pdfs = commands.add_parser("link-pdfs", help="为已入库论文补建或修复 Zotero PDF 链接")
-    link_pdfs.add_argument("--vault", type=Path, required=True)
+    link_pdfs.add_argument(
+        "--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）"
+    )
+    convert = commands.add_parser("convert", help="列出或转换明确选择的已入库论文")
+    convert.add_argument("--vault", type=Path, help="vault 路径（默认：从当前目录向上发现）")
+    mode = convert.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--list", action="store_true", help="列出所有论文的转换就绪状态")
+    mode.add_argument(
+        "--key",
+        action="append",
+        dest="keys",
+        metavar="ITEM_KEY",
+        help="转换指定 Zotero item key；可重复使用",
+    )
     return result
 
 
-def _vault(value: Path) -> Path:
-    return value.expanduser().resolve()
+def _vault(value: Path | None, *, for_init: bool = False) -> Path:
+    """Resolve an explicit vault or discover the nearest initialized ancestor."""
+    try:
+        if value is not None:
+            return value.expanduser().resolve()
+        current = Path.cwd().resolve()
+    except (OSError, RuntimeError) as error:
+        raise PipelineError(f"无法解析 vault 路径：{error}") from error
+
+    if for_init:
+        return current
+    for candidate in (current, *current.parents):
+        marker = candidate / ".pipeline" / "config.toml"
+        if marker.exists() or marker.is_symlink():
+            return candidate
+    raise PipelineError(
+        f"无法从当前目录向上找到 .pipeline/config.toml：{current}；"
+        "请进入已初始化的 vault，或显式提供 --vault"
+    )
 
 
 def doctor(vault: Path) -> int:
@@ -52,6 +88,11 @@ def doctor(vault: Path) -> int:
     except PipelineError as error:
         print(f"待处理：配置 — {error}")
         return 1
+    try:
+        load_vault_token(vault)
+        print("通过：MinerU Token（convert 可用）")
+    except PipelineError as error:
+        print(f"提示：MinerU Token 未就绪，sync 不受影响 — {error}")
     try:
         with tempfile.TemporaryFile(dir=vault) as handle:
             handle.write(b"check")
@@ -92,17 +133,43 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{collection.get('key', '')}  {data.get('name', '')}  (parent: {parent})")
             return 0
 
-        vault = _vault(args.vault)
+        vault = _vault(args.vault, for_init=args.command == "init")
         if args.command == "init":
             vault.mkdir(parents=True, exist_ok=True)
             with VaultLock(vault):
-                initialize(vault, args.collection, args.zotero_url)
+                initialize(
+                    vault,
+                    args.collection,
+                    args.zotero_url,
+                    pdf2md_model=args.pdf2md_model,
+                    pdf2md_language=args.pdf2md_language,
+                    pdf2md_ocr=args.pdf2md_ocr,
+                    pdf2md_timeout=args.pdf2md_timeout,
+                )
             print(f"已初始化：{vault}")
             return 0
         if args.command == "doctor":
             return doctor(vault)
 
         config = load_config(vault)
+        if args.command == "convert":
+            service = ConversionService(vault, config, Zotero(config.zotero_url))
+            if args.list:
+                for candidate in service.list_candidates():
+                    print(
+                        f"{candidate.item_key}  {candidate.status:<11}  "
+                        f"{candidate.paper_folder.name}  ({candidate.detail})"
+                    )
+                return 0
+            token = load_vault_token(vault)
+            summary = service.convert_selected(args.keys, token)
+            for message in summary.messages:
+                print(message, file=sys.stderr)
+            print(
+                f"转换完成：selected={summary.selected} converted={summary.converted} "
+                f"skipped={summary.skipped} failed={summary.failed}"
+            )
+            return 0 if summary.successful else 1
         if args.command == "link-pdfs":
             with VaultLock(vault):
                 summary = PdfLinker(Zotero(config.zotero_url)).link_existing(vault)
@@ -124,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
             f"pdf_linked={summary.pdf_linked} pdf_missing={summary.pdf_missing} "
             f"pdf_failed={summary.pdf_failed}"
         )
+        if summary.created_keys:
+            print("本轮新增 key：" + " ".join(summary.created_keys))
         return 0 if summary.successful else 1
     except (PipelineError, OSError, ValueError, TypeError) as error:
         print(f"错误：{error}", file=sys.stderr)

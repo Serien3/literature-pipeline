@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "literature-pipeline"
-version = "0.1.0"
-description = "Import Zotero metadata and link local PDFs into an Obsidian vault"
+version = "0.2.0"
+description = "Import Zotero papers into an Obsidian vault and convert PDFs to Markdown"
 readme = "README.md"
 requires-python = ">=3.11"
 keywords = ["obsidian", "research", "zotero"]
@@ -20,6 +20,8 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: Markdown",
 ]
 dependencies = [
+    "mineru-open-sdk==0.2.5",
+    "python-dotenv==1.0.1",
     "PyYAML>=6.0,<7",
 ]
 

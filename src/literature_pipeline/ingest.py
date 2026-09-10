@@ -27,6 +27,7 @@ class ImportSummary:
     pdf_linked: int = 0
     pdf_missing: int = 0
     pdf_failed: int = 0
+    created_keys: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
 
     @property
@@ -115,6 +116,7 @@ class Importer:
                     continue
                 existing.add(item_key)
                 summary.created += 1
+                summary.created_keys.append(item_key)
                 pdf = self.pdf_linker.link_paper(folder, item_key)
                 summary.pdf_linked += pdf.linked
                 summary.pdf_missing += pdf.missing
