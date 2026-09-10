@@ -108,13 +108,12 @@ def _attachment(child: object, parent_key: str) -> PdfAttachment | None:
     return PdfAttachment(attachment_key, filename)
 
 
-def _normalized(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _link_target(link: Path) -> Path:
-    raw = Path(os.readlink(link))
-    return raw if raw.is_absolute() else link.parent / raw
+def _same_file(left: Path, right: Path) -> bool:
+    """Return whether two paths identify the same file, following symlinks."""
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
 
 
 def _atomic_replace_symlink(link: Path, target: Path) -> None:
@@ -158,7 +157,7 @@ def ensure_pdf_link(folder: Path, attachment: PdfAttachment, target: Path) -> st
                 desired.unlink(missing_ok=True)
                 raise
             return "linked"
-        if _normalized(_link_target(current)) != _normalized(target):
+        if not _same_file(current, target):
             _atomic_replace_symlink(current, target)
             return "linked"
         return "unchanged"
@@ -250,7 +249,7 @@ class PdfLinker:
                 f"需要恰好一个 attachment {attachment.key} 的 PDF 符号链接，实际为 {len(managed)} 个"
             )
         link = managed[0]
-        if _normalized(_link_target(link)) != _normalized(target):
+        if not _same_file(link, target):
             raise PipelineError(f"PDF 符号链接不是 Zotero 当前附件目标：{link}")
         return 1, AvailablePdf(attachment.key, link)
 

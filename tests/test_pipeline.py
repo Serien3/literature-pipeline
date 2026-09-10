@@ -564,6 +564,30 @@ class PdfLinkTests(unittest.TestCase):
         self.assertEqual(repaired_again.linked, 1)
         self.assertEqual(repaired.resolve(), replacement.resolve())
 
+    def test_equivalent_paths_to_same_pdf_are_accepted(self):
+        source = self.source("source.pdf")
+        alias = self.root / "source-alias.pdf"
+        alias.symlink_to(source)
+        folder = self.vault / "paper"
+        folder.mkdir()
+        managed = folder / "paper [PDFKEY01].pdf"
+        managed.symlink_to(alias)
+        zotero = FakeZotero(
+            [],
+            {"PAPER001": [pdf_attachment("PDFKEY01")]},
+            {"PDFKEY01": source.as_uri()},
+        )
+        linker = PdfLinker(zotero)
+
+        linked = linker.link_paper(folder, "PAPER001")
+        count, available = linker.conversion_pdf(folder, "PAPER001")
+
+        self.assertEqual(linked.unchanged, 1)
+        self.assertEqual(linked.linked, 0)
+        self.assertEqual(count, 1)
+        self.assertIsNotNone(available)
+        self.assertEqual(available.path, managed)
+
     def test_ordinary_file_collision_is_preserved(self):
         folder = self.vault / "paper"
         folder.mkdir()
