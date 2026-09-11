@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import threading
 import time
@@ -45,6 +46,7 @@ from literature_pipeline.pdf_links import (
 from literature_pipeline.pdf2md import (
     ConversionError,
     ConversionOptions,
+    _staging_mode,
     convert_pdf,
     convert_pdf_into_paper,
     load_vault_token,
@@ -849,6 +851,10 @@ class Pdf2MdTests(unittest.TestCase):
         FakeMinerUResult(include_full=False).save_all(str(missing))
         with self.assertRaises(ConversionError):
             organize_result(missing)
+
+    def test_staging_mode_inherits_windows_acl_but_remains_private_on_posix(self):
+        expected = 0o777 if os.name == "nt" else 0o700
+        self.assertEqual(_staging_mode(), expected)
 
     def test_standalone_conversion_keeps_result_directory_but_no_pdf_copy(self):
         client = FakeMinerUClient("secret")

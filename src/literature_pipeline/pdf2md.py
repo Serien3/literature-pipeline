@@ -6,10 +6,11 @@ import argparse
 import os
 import shutil
 import sys
-import tempfile
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .files import PipelineError
 
@@ -20,6 +21,23 @@ PIPELINE_OUTPUT_NAMES = ("full.md", "images", "temp")
 
 class ConversionError(PipelineError):
     """An expected, user-facing conversion error."""
+
+
+def _staging_mode() -> int:
+    # On Windows, os.mkdir(0o700) creates a private ACL. Files and directories
+    # moved or hard-linked out of it retain that ACL, so use normal inheritance.
+    return 0o777 if os.name == "nt" else 0o700
+
+
+@contextmanager
+def _result_staging_directory(parent: Path, prefix: str) -> Iterator[Path]:
+    """Create a private POSIX staging dir with inheritable Windows ACLs."""
+    directory = parent / f"{prefix}{uuid.uuid4().hex}"
+    directory.mkdir(mode=_staging_mode())
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def positive_int(value: str) -> int:
@@ -218,10 +236,9 @@ def convert_pdf(
     pdf, destination = validate_options(options)
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f".{destination.name}-", dir=destination.parent
-        ) as temporary:
-            staging = Path(temporary)
+        with _result_staging_directory(
+            destination.parent, f".{destination.name}-"
+        ) as staging:
             _save_result(options, pdf, staging, client_factory)
             if destination.exists():
                 shutil.rmtree(destination)
@@ -264,12 +281,7 @@ def convert_pdf_into_paper(
     pdf, _ = _validate_common(options)
 
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=".pdf2md-",
-            dir=paper_folder,
-            ignore_cleanup_errors=True,
-        ) as temporary:
-            staging = Path(temporary)
+        with _result_staging_directory(paper_folder, ".pdf2md-") as staging:
             _save_result(options, pdf, staging, client_factory)
             ensure_pipeline_destination_available(paper_folder)
             entries = list(staging.iterdir())
