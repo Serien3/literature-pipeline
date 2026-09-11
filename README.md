@@ -69,6 +69,9 @@ PDF 使用文件符号链接。Windows 请先开启“开发者模式”，或�
 .\.venv\Scripts\literature-pipeline.exe sync
 ```
 
+`sync` 会串行、原子地写入元数据，再为本轮新增论文以最多 4 路并发查询并建立
+PDF 链接；运行期间会在标准错误流显示阶段和链接进度。最终汇总格式保持稳定。
+
 新论文直接建立在 vault 根目录；`sync` 结束时尚未产生转换结果：
 
 ```text

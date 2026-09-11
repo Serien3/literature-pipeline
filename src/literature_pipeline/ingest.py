@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .files import (
     PipelineError,
@@ -14,8 +16,12 @@ from .files import (
     render_zotero_json,
 )
 from .library import Config, index_existing
-from .pdf_links import PdfLinker
+from .pdf_links import PdfLinkSummary, PdfLinker
 from .zotero import Zotero, key
+
+
+SYNC_PDF_WORKERS = 4
+_PROGRESS_STEPS = 20
 
 
 @dataclass
@@ -40,9 +46,9 @@ class Importer:
         self.vault = vault
         self.config = config
         self.zotero = zotero
-        self.pdf_linker = PdfLinker(zotero)
 
-    def sync(self) -> ImportSummary:
+    def sync(self, progress: Callable[[str], None] | None = None) -> ImportSummary:
+        self._report(progress, "正在读取 Zotero Collection……")
         items = self.zotero.items(self.config.collection)
         if not isinstance(items, list):
             raise PipelineError("Zotero Collection 响应不是条目列表")
@@ -73,6 +79,8 @@ class Importer:
                 summary.messages.append(f"Zotero 响应包含重复 key：{item_key}")
 
         existing = index.keys
+        pdf_tasks: list[tuple[str, Path]] = []
+        self._report(progress, f"正在处理 {len(candidates)} 个 Zotero 条目……")
         for item_key, data in candidates:
             try:
                 if item_key in conflict_keys:
@@ -117,15 +125,74 @@ class Importer:
                 existing.add(item_key)
                 summary.created += 1
                 summary.created_keys.append(item_key)
-                pdf = self.pdf_linker.link_paper(folder, item_key)
-                summary.pdf_linked += pdf.linked
-                summary.pdf_missing += pdf.missing
-                summary.pdf_failed += pdf.failed + pdf.conflicts
-                summary.messages.extend(pdf.messages)
+                pdf_tasks.append((item_key, folder))
             except (PipelineError, OSError, UnicodeError, ValueError, TypeError) as error:
                 summary.failed += 1
                 summary.messages.append(f"Zotero 条目 {item_key} 入库失败：{error}")
+        self._link_created_papers(pdf_tasks, summary, progress)
         return summary
+
+    def _link_created_papers(
+        self,
+        tasks: list[tuple[str, Path]],
+        summary: ImportSummary,
+        progress: Callable[[str], None] | None,
+    ) -> None:
+        total = len(tasks)
+        if total == 0:
+            return
+        workers = min(SYNC_PDF_WORKERS, total)
+        self._report(
+            progress,
+            f"本轮新增 {total} 篇论文，正在建立 PDF 链接（最多 {workers} 路并发）……",
+        )
+        if workers == 1:
+            results = [self._link_paper(*tasks[0])]
+            self._report(progress, "PDF 链接进度：1/1")
+        else:
+            results: list[PdfLinkSummary | None] = [None] * total
+            completed = 0
+            interval = max(1, (total + _PROGRESS_STEPS - 1) // _PROGRESS_STEPS)
+            executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sync-pdf")
+            futures: dict[Future[PdfLinkSummary], int] = {}
+            try:
+                for position, task in enumerate(tasks):
+                    futures[executor.submit(self._link_paper, *task)] = position
+                for future in as_completed(futures):
+                    results[futures[future]] = future.result()
+                    completed += 1
+                    if completed == total or completed % interval == 0:
+                        self._report(progress, f"PDF 链接进度：{completed}/{total}")
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+        for (item_key, _), result in zip(tasks, results):
+            if result is None:
+                raise PipelineError(f"论文 {item_key} 的 PDF 链接任务没有返回结果")
+            summary.pdf_linked += result.linked
+            summary.pdf_missing += result.missing
+            summary.pdf_failed += result.failed + result.conflicts
+            summary.messages.extend(result.messages)
+
+    def _link_paper(self, item_key: str, folder: Path) -> PdfLinkSummary:
+        try:
+            session = self.zotero.new_session()
+            return PdfLinker(session).link_paper(folder, item_key)
+        except (PipelineError, OSError, UnicodeError, ValueError, TypeError) as error:
+            return PdfLinkSummary(
+                papers=1,
+                failed=1,
+                messages=[f"论文 {item_key} 无法读取附件：{error}"],
+            )
+
+    @staticmethod
+    def _report(progress: Callable[[str], None] | None, message: str) -> None:
+        if progress is not None:
+            progress(message)
 
     @staticmethod
     def _validate_item(item: object) -> tuple[str, dict]:

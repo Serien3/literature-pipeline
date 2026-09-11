@@ -199,7 +199,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0 if summary.successful else 1
         with VaultLock(vault):
-            summary = Importer(vault, config, Zotero(config.zotero_url)).sync()
+            summary = Importer(vault, config, Zotero(config.zotero_url)).sync(
+                progress=lambda message: print(message, file=sys.stderr, flush=True)
+            )
         for message in summary.messages:
             print(message, file=sys.stderr)
         print(

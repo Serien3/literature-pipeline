@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -34,7 +36,12 @@ from literature_pipeline.library import (
     initialize,
     load_config,
 )
-from literature_pipeline.pdf_links import PdfLinker, file_uri_path, pdf_link_name
+from literature_pipeline.pdf_links import (
+    PdfLinkSummary,
+    PdfLinker,
+    file_uri_path,
+    pdf_link_name,
+)
 from literature_pipeline.pdf2md import (
     ConversionError,
     ConversionOptions,
@@ -92,6 +99,9 @@ class FakeZotero:
 
     def items(self, _collection: str) -> list[dict]:
         return self.entries
+
+    def new_session(self):
+        return FakeZotero(self.entries, self.children_by_parent, self.file_urls)
 
     def children(self, parent_key: str) -> list[dict]:
         return self.children_by_parent.get(parent_key, [])
@@ -518,6 +528,91 @@ class PdfLinkTests(unittest.TestCase):
         self.assertEqual(summary.pdf_failed, 0)
         self.assertTrue((folder / "meta.md").is_file())
         self.assertTrue((folder / "zotero-item.json").is_file())
+
+    def test_sync_links_new_papers_with_at_most_four_concurrent_sessions(self):
+        entries = [item(f"PAPER{number:03d}") for number in range(1, 7)]
+        lock = threading.Lock()
+        release = threading.Event()
+        shared = {"active": 0, "peak": 0, "sessions": []}
+
+        class ConcurrentZotero(FakeZotero):
+            def new_session(session_self):
+                session = ConcurrentZotero(
+                    session_self.entries,
+                    session_self.children_by_parent,
+                    session_self.file_urls,
+                )
+                with lock:
+                    shared["sessions"].append(session)
+                return session
+
+            def children(session_self, parent_key):
+                del session_self, parent_key
+                with lock:
+                    shared["active"] += 1
+                    shared["peak"] = max(shared["peak"], shared["active"])
+                    if shared["peak"] == 4:
+                        release.set()
+                if not release.wait(timeout=2):
+                    raise AssertionError("four PDF link workers did not run concurrently")
+                with lock:
+                    shared["active"] -= 1
+                return []
+
+        progress = []
+        summary = Importer(
+            self.vault,
+            self.config,
+            ConcurrentZotero(entries),
+        ).sync(progress.append)
+
+        self.assertEqual(summary.created, 6)
+        self.assertEqual(summary.pdf_missing, 6)
+        self.assertEqual(shared["peak"], 4)
+        self.assertEqual(len(shared["sessions"]), 6)
+        self.assertEqual(len({id(session) for session in shared["sessions"]}), 6)
+        self.assertIn("PDF 链接进度：6/6", progress)
+
+    def test_sync_merges_concurrent_pdf_messages_in_item_order(self):
+        entries = [item(f"PAPER{number:03d}") for number in range(1, 4)]
+
+        class ReverseCompletionImporter(Importer):
+            def _link_paper(self, item_key, folder):
+                del folder
+                time.sleep({"PAPER001": 0.03, "PAPER002": 0.02, "PAPER003": 0.01}[item_key])
+                return PdfLinkSummary(papers=1, failed=1, messages=[item_key])
+
+        summary = ReverseCompletionImporter(
+            self.vault,
+            self.config,
+            FakeZotero(entries),
+        ).sync()
+
+        self.assertEqual(summary.messages, ["PAPER001", "PAPER002", "PAPER003"])
+        self.assertEqual(summary.pdf_failed, 3)
+
+    def test_repeat_sync_does_not_create_pdf_sessions(self):
+        class TrackingZotero(FakeZotero):
+            def __init__(self, *args, session_count=None, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.session_count = session_count if session_count is not None else []
+
+            def new_session(self):
+                self.session_count.append(1)
+                return TrackingZotero(
+                    self.entries,
+                    self.children_by_parent,
+                    self.file_urls,
+                    session_count=self.session_count,
+                )
+
+        zotero = TrackingZotero([item()])
+        importer = Importer(self.vault, self.config, zotero)
+        importer.sync()
+        self.assertEqual(len(zotero.session_count), 1)
+
+        importer.sync()
+        self.assertEqual(len(zotero.session_count), 1)
 
     def test_unavailable_pdf_reports_failure_after_metadata_success(self):
         missing = (self.root / "missing.pdf").as_uri()
@@ -1079,17 +1174,35 @@ class AdapterAndCliTests(unittest.TestCase):
             with self.assertRaises(PipelineError):
                 api.listing("users/0/collections")
 
+    def test_zotero_new_session_is_independent_and_pinned(self):
+        api = Zotero()
+        api.server_id = "database-id"
+        session = api.new_session()
+
+        self.assertIsNot(session, api)
+        self.assertIsNot(session.opener, api.opener)
+        self.assertEqual(session.url, api.url)
+        self.assertEqual(session.server_id, "database-id")
+        self.assertEqual(session.last_version, "")
+
     def test_cli_sync_reports_summary_and_exit_code(self):
         with tempfile.TemporaryDirectory() as root:
             vault = Path(root) / "vault"
             initialize(vault, "COLLECT1", "http://localhost:23119/api/")
             output = io.StringIO()
-            with patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()), redirect_stdout(output):
+            progress = io.StringIO()
+            with (
+                patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()),
+                redirect_stdout(output),
+                redirect_stderr(progress),
+            ):
                 result = main(["sync", "--vault", str(vault)])
             self.assertEqual(result, 0)
             self.assertIn("created=1 skipped=0 conflicts=0 failed=0", output.getvalue())
             self.assertIn("pdf_linked=0 pdf_missing=1 pdf_failed=0", output.getvalue())
             self.assertIn("本轮新增 key：PAPER001", output.getvalue())
+            self.assertIn("正在读取 Zotero Collection", progress.getvalue())
+            self.assertIn("PDF 链接进度：1/1", progress.getvalue())
 
     def test_cli_sync_never_requires_mineru_token(self):
         with tempfile.TemporaryDirectory() as root:

@@ -121,7 +121,8 @@ PDF 符号链接名固定为 `<清理后的 filename stem> [<attachment-key>].pd
 3. create-only、原子发布 `zotero-item.json`。
 4. create-only、原子发布 `meta.md`。
 5. 只有 `meta.md` 发布后才计为 `created`。
-6. 读取并链接 PDF child attachments。
+6. 元数据全部处理后，为本轮新增论文读取并链接 PDF child attachments；不同论文之间
+   最多 4 路并发，同一论文内的附件仍按原顺序处理。
 7. 在汇总后列出本轮新增的 item key，供用户选择后续转换对象。
 
 若只有合法 sidecar 而没有 `meta.md`，必须从 sidecar 快照恢复，不得改用较新的 Zotero 数据。`meta.md` 一旦存在即表示已入库；后续 `sync` 直接跳过，不更新元数据、不补建 sidecar，也不检查转换结果。

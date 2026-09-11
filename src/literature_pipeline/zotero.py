@@ -35,6 +35,12 @@ class Zotero:
         self.last_version = ""
         self.opener = build_opener(ProxyHandler({}))
 
+    def new_session(self) -> Zotero:
+        """Return an independent client pinned to the current Zotero database."""
+        session = Zotero(self.url)
+        session.server_id = self.server_id
+        return session
+
     def _read(self, path: str) -> bytes:
         headers = {"Zotero-API-Version": "3"}
         if self.server_id:
