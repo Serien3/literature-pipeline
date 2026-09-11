@@ -144,33 +144,29 @@ PDF 符号链接名固定为 `<清理后的 filename stem> [<attachment-key>].pd
 
 `sync` 与 `link-pdfs` 不得触发 MinerU。裸 `convert` 必须显示所有已入库论文的状态并允许交互选择；`convert --list` 提供等价的纯文本状态列表。候选查询不得要求 Token 或消耗 MinerU 额度。
 
-裸 `convert` 只在交互终端中启动 TUI，初始不得选择任何论文；只有用户勾选一个或多个 `Ready` 项并通过额度确认后才可触发转换。`convert --key <item-key>` 是非交互入口，`--key` 可以重复并直接构成转换授权。两种入口都不得提供隐式全选，选择范围包括所有已完成入库的历史或新论文。stdin 或 stdout 不是终端时，裸 `convert` 必须在访问 Zotero 和读取 Token 前报错，提示改用 `--list` 或 `--key`。
+裸 `convert` 只在交互终端中启动 TUI，初始不得选择任何论文；只有用户勾选一个或多个 `Ready` 项并通过额度确认后才可触发转换。`convert --key <item-key>` 是非交互入口，`--key` 可以重复并直接构成转换授权。两种入口都不得提供隐式全选，选择范围包括所有已完成入库的历史或新论文。stdin 或 stdout 不是终端时，裸 `convert` 必须在读取 Token 前报错，提示改用 `--list` 或 `--key`。所有 `convert` 模式只读取 vault，不得访问 Zotero。
 
 TUI 必须显示全部候选状态，只有 `Ready` 可选；支持键盘移动、当前项切换、当前过滤结果中的 Ready 全选、搜索、详情和二次确认。搜索至少匹配 item key、论文目录名、状态和详情。用户取消返回 130。确认退出 TUI 后使用普通前台日志执行转换，不在 TUI 中运行远程任务。
 
-候选状态至少包括：
+候选状态只包括：
 
-- `Ready`：满足全部转换前置条件。
+- `Ready`：恰好有一个有效的受管理 PDF 符号链接，且没有转换输出冲突。
 - `Converted`：论文目录已有普通文件 `full.md`。
-- `No PDF`：Zotero 中没有有效 PDF attachment。
-- `Multiple`：Zotero 中有多个有效 PDF attachments。
-- `Unavailable`：唯一 PDF 未下载、当前受管理符号链接缺失、重复、失效或未指向 Zotero 当前文件。
-- `Conflict`：本地 key 冲突，或 `full.md`、`images`、`temp` 等输出名称被不兼容内容占用。
+- `Unavailable`：受管理 PDF 链接缺失、重复或失效，本地 key 冲突，或 `full.md`、`images`、`temp` 等输出名称被不兼容内容占用；详情必须说明具体原因。
 
-每个被选择的 key 必须对应唯一完成论文目录，并且 Zotero 当前返回的有效 PDF child attachment 总数恰好为一个。程序必须读取当前附件 file URI，并确认论文目录中恰好有一个按 attachment key 管理、指向该当前文件的 PDF 符号链接。`convert` 不得自行创建或修复链接；不满足时应提示用户先处理附件或运行 `link-pdfs`。
+每个被选择的 key 必须对应唯一完成论文目录，且论文目录中恰好有一个名称以合法 attachment key 管理的 PDF 符号链接。链接目标必须存在且为普通文件。普通 PDF 文件和不符合受管理命名格式的符号链接不得作为转换输入。`convert` 不得自行创建或修复链接；Zotero 附件变化后由用户运行 `link-pdfs` 刷新链接。
 
 多个 key 在 `--key` 模式下按命令行顺序、在 TUI 模式下按界面列表顺序串行前台执行。程序只在建立本地索引时短暂持有 vault 主写锁；远程转换不得持有主锁。每个转换使用按 item key 区分的细粒度 OS 文件锁，锁只表示活跃进程，不是持久状态。
 
 ### 9.2 额度保护预检
 
-调用 MinerU 前，程序必须完成所有可在本地或 Zotero Local API 免费确定的检查：
+调用 MinerU 前，程序必须完成全部本地预检：
 
 1. key、完成论文目录和本地 key 唯一性有效。
 2. Token 与转换配置有效。
-3. Zotero PDF attachment 恰好一个且本机文件存在。
-4. 受管理 PDF 符号链接唯一、有效并指向当前附件。
-5. 取得该论文转换锁。
-6. 论文目录中 `full.md`、`images` 和 `temp` 均未占用。
+3. 受管理 PDF 符号链接恰好一个，链接有效且目标为普通文件。
+4. 取得该论文转换锁。
+5. 论文目录中 `full.md`、`images` 和 `temp` 均未占用。
 
 任一预检失败均不得实例化 MinerU 客户端或上传 PDF。普通文件 `full.md` 已存在时视为 `Converted` 并安全跳过，不提供自动覆盖选项。
 
@@ -251,7 +247,7 @@ pdf_linked pdf_missing pdf_failed
 4. sidecar-only 中断可从原快照恢复，重复 key 与路径冲突不覆盖。
 5. 所有 PDF attachment 都建立符号链接；缺失和冲突不回滚元数据。
 6. `sync` 在任何配置下都不读取 Token、不调用 MinerU，并列出本轮新增 key。
-7. `convert --list` 无 Token 时仍可列出 Ready、Converted、No PDF、Multiple、Unavailable 和 Conflict 状态；TUI 浏览和取消同样不要求 Token。
+7. `convert --list` 无 Token 且 Zotero 关闭时仍可列出 Ready、Converted 和 Unavailable 状态；TUI 浏览和取消同样不要求 Token。
 8. 裸 `convert` 在交互终端中初始为空选择，只有选择 Ready 项并确认后才转换；非交互终端必须拒绝。一个或多个明确 key 仍可选择历史或新论文。
 9. 无 PDF、多 PDF、链接无效、输出冲突或重复 key 在 MinerU 客户端创建前失败。
 10. 普通 `full.md` 已存在时安全跳过，不重复消耗额度；只有再次明确选择才能重试未完成论文。

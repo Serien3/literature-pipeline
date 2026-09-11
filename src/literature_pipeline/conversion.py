@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .files import PipelineError, PdfConversionLock, VaultLock
 from .library import Config, ExistingIndex, index_existing
 from .pdf2md import ConversionOptions, convert_pdf_into_paper
-from .pdf_links import AvailablePdf, PdfLinker
-from .zotero import Zotero, key
+from .zotero import key
+
+
+_MANAGED_PDF_LINK = re.compile(r"^.+ \[[A-Z0-9]{8}\]\.pdf$")
 
 
 @dataclass(frozen=True)
@@ -18,7 +21,7 @@ class ConversionCandidate:
     paper_folder: Path
     status: str
     detail: str
-    pdf: AvailablePdf | None = None
+    pdf: Path | None = None
 
 
 @dataclass
@@ -35,10 +38,9 @@ class ConversionSummary:
 
 
 class ConversionService:
-    def __init__(self, vault: Path, config: Config, zotero: Zotero):
+    def __init__(self, vault: Path, config: Config):
         self.vault = vault
         self.config = config
-        self.pdf_linker = PdfLinker(zotero)
 
     def _index(self) -> ExistingIndex:
         with VaultLock(self.vault):
@@ -49,7 +51,7 @@ class ConversionService:
         if full_markdown.is_file() and not full_markdown.is_symlink():
             return ConversionCandidate(item_key, folder, "Converted", "full.md 已存在")
         if full_markdown.exists() or full_markdown.is_symlink():
-            return ConversionCandidate(item_key, folder, "Conflict", "full.md 不是普通文件")
+            return ConversionCandidate(item_key, folder, "Unavailable", "full.md 不是普通文件")
         occupied = [
             name
             for name in ("images", "temp")
@@ -59,25 +61,40 @@ class ConversionService:
             return ConversionCandidate(
                 item_key,
                 folder,
-                "Conflict",
+                "Unavailable",
                 "已有转换目标：" + "、".join(occupied),
             )
         try:
-            count, available = self.pdf_linker.conversion_pdf(folder, item_key)
-        except (PipelineError, OSError, UnicodeError, ValueError, TypeError) as error:
+            available = self._local_pdf(folder)
+        except (PipelineError, OSError) as error:
             return ConversionCandidate(item_key, folder, "Unavailable", str(error))
-        if count == 0:
-            return ConversionCandidate(item_key, folder, "No PDF", "Zotero 中没有 PDF 附件")
-        if count > 1:
-            return ConversionCandidate(
-                item_key,
-                folder,
-                "Multiple",
-                f"Zotero 中有 {count} 个 PDF 附件",
-            )
-        if available is None:
-            return ConversionCandidate(item_key, folder, "Unavailable", "唯一 PDF 不可用")
         return ConversionCandidate(item_key, folder, "Ready", "可以转换", available)
+
+    @staticmethod
+    def _local_pdf(folder: Path) -> Path:
+        if folder.is_symlink() or not folder.is_dir():
+            raise PipelineError(f"论文目录不是普通目录：{folder}")
+        try:
+            managed = [
+                path
+                for path in folder.iterdir()
+                if path.is_symlink() and _MANAGED_PDF_LINK.fullmatch(path.name)
+            ]
+        except OSError as error:
+            raise PipelineError(f"无法扫描论文目录中的 PDF 链接：{folder}") from error
+        if not managed:
+            raise PipelineError("没有受管理的 PDF 符号链接；请先运行 link-pdfs")
+        if len(managed) > 1:
+            raise PipelineError(f"有 {len(managed)} 个受管理的 PDF 符号链接，无法确定转换对象")
+
+        link = managed[0]
+        try:
+            target = link.resolve(strict=True)
+        except OSError as error:
+            raise PipelineError(f"PDF 符号链接已经失效：{link}") from error
+        if not target.is_file():
+            raise PipelineError(f"PDF 符号链接目标不是普通文件：{link}")
+        return link
 
     def list_candidates(self) -> list[ConversionCandidate]:
         index = self._index()
@@ -87,7 +104,12 @@ class ConversionService:
             folder = paths[0].parent
             if item_key in conflicts:
                 candidates.append(
-                    ConversionCandidate(item_key, folder, "Conflict", "多个论文目录声明同一 key")
+                    ConversionCandidate(
+                        item_key,
+                        folder,
+                        "Unavailable",
+                        "多个论文目录声明同一 key",
+                    )
                 )
             else:
                 candidates.append(self.inspect(item_key, folder))
@@ -135,7 +157,7 @@ class ConversionService:
                     if candidate.status != "Ready" or candidate.pdf is None:
                         raise PipelineError(f"{candidate.status}：{candidate.detail}")
                     options = ConversionOptions(
-                        pdf=candidate.pdf.path,
+                        pdf=candidate.pdf,
                         output_root=folder,
                         token=token,
                         model=self.config.pdf2md.model,

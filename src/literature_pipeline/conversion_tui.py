@@ -35,10 +35,7 @@ from .conversion import ConversionCandidate
 _STATUS_ORDER = {
     "Ready": 0,
     "Converted": 1,
-    "No PDF": 2,
-    "Multiple": 3,
-    "Unavailable": 4,
-    "Conflict": 5,
+    "Unavailable": 2,
 }
 
 
@@ -364,10 +361,7 @@ def run_conversion_picker(
             "cursor": "reverse",
             "status.ready": "fg:#00aa00 bold",
             "status.converted": "fg:#00aaaa",
-            "status.no-pdf": "fg:#888888",
-            "status.multiple": "fg:#aa00aa",
             "status.unavailable": "fg:#aa5500",
-            "status.conflict": "fg:#aa0000 bold",
             "detail.label": "bold",
             "toolbar": "reverse",
             "warning": "fg:#aa5500 bold",

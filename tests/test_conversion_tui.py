@@ -37,12 +37,12 @@ class PickerModelTests(unittest.TestCase):
     def setUp(self):
         self.model = PickerModel(
             [
-                candidate("PAPER006", "Conflict", "Zeta", "本地 key 冲突"),
+                candidate("PAPER006", "Unavailable", "Zeta", "本地 key 冲突"),
                 candidate("PAPER002", "Ready", "Beta"),
                 candidate("PAPER003", "Converted", "Gamma"),
                 candidate("PAPER001", "Ready", "Alpha"),
-                candidate("PAPER004", "No PDF", "Delta"),
-                candidate("PAPER005", "Multiple", "Epsilon"),
+                candidate("PAPER004", "Unavailable", "Delta", "没有 PDF 链接"),
+                candidate("PAPER005", "Unavailable", "Epsilon", "有多个 PDF 链接"),
                 candidate("PAPER007", "Unavailable", "Eta"),
             ]
         )

@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
                     "当前终端不支持交互界面；请使用 convert --list 或 "
                     "convert --key ITEM_KEY"
                 )
-            service = ConversionService(vault, config, Zotero(config.zotero_url))
+            service = ConversionService(vault, config)
             if args.list:
                 for candidate in service.list_candidates():
                     print(

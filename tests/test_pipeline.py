@@ -675,13 +675,8 @@ class PdfLinkTests(unittest.TestCase):
         linker = PdfLinker(zotero)
 
         linked = linker.link_paper(folder, "PAPER001")
-        count, available = linker.conversion_pdf(folder, "PAPER001")
-
         self.assertEqual(linked.unchanged, 1)
         self.assertEqual(linked.linked, 0)
-        self.assertEqual(count, 1)
-        self.assertIsNotNone(available)
-        self.assertEqual(available.path, managed)
 
     def test_ordinary_file_collision_is_preserved(self):
         folder = self.vault / "paper"
@@ -956,7 +951,7 @@ class ConversionServiceTests(unittest.TestCase):
             {"PDFKEY01": source.as_uri()},
         )
         Importer(self.vault, self.config, zotero).sync()
-        service = ConversionService(self.vault, self.config, zotero)
+        service = ConversionService(self.vault, self.config)
         self.assertEqual(service.list_candidates()[0].status, "Ready")
         observed = []
 
@@ -976,7 +971,7 @@ class ConversionServiceTests(unittest.TestCase):
         self.assertEqual(repeated.skipped, 1)
         converter.assert_not_called()
 
-    def test_list_reports_no_pdf_multiple_converted_and_ready(self):
+    def test_list_reports_unavailable_converted_and_ready(self):
         entries = [item(f"PAPER00{number}") for number in range(1, 5)]
         first, second = self.source("first.pdf"), self.source("second.pdf")
         ready = self.source("ready.pdf")
@@ -1005,13 +1000,13 @@ class ConversionServiceTests(unittest.TestCase):
         )
         statuses = {
             candidate.item_key: candidate.status
-            for candidate in ConversionService(self.vault, self.config, zotero).list_candidates()
+            for candidate in ConversionService(self.vault, self.config).list_candidates()
         }
         self.assertEqual(
             statuses,
             {
-                "PAPER001": "No PDF",
-                "PAPER002": "Multiple",
+                "PAPER001": "Unavailable",
+                "PAPER002": "Unavailable",
                 "PAPER003": "Converted",
                 "PAPER004": "Ready",
             },
@@ -1025,7 +1020,7 @@ class ConversionServiceTests(unittest.TestCase):
             {"PDFKEY01": first.as_uri(), "PDFKEY02": second.as_uri()},
         )
         Importer(self.vault, self.config, multiple_zotero).sync()
-        service = ConversionService(self.vault, self.config, multiple_zotero)
+        service = ConversionService(self.vault, self.config)
         with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
             summary = service.convert_selected(["PAPER001"], "token")
         self.assertEqual(summary.failed, 1)
@@ -1039,12 +1034,107 @@ class ConversionServiceTests(unittest.TestCase):
             {"PDFKEY01": missing.as_uri()},
         )
         Importer(self.vault, self.config, zotero).sync()
-        service = ConversionService(self.vault, self.config, zotero)
+        service = ConversionService(self.vault, self.config)
         self.assertEqual(service.list_candidates()[0].status, "Unavailable")
         with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
             summary = service.convert_selected(["PAPER001"], "token")
         self.assertEqual(summary.failed, 1)
         converter.assert_not_called()
+
+    def test_only_one_valid_managed_pdf_symlink_is_ready(self):
+        service = ConversionService(self.vault, self.config)
+        source = self.source()
+
+        ordinary = self.vault / "ordinary"
+        ordinary.mkdir()
+        (ordinary / "Paper [PDFKEY01].pdf").write_bytes(b"%PDF")
+        candidate = service.inspect("PAPER001", ordinary)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("没有受管理", candidate.detail)
+
+        unmanaged = self.vault / "unmanaged"
+        unmanaged.mkdir()
+        (unmanaged / "paper.pdf").symlink_to(source)
+        candidate = service.inspect("PAPER001", unmanaged)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("没有受管理", candidate.detail)
+
+        broken = self.vault / "broken"
+        broken.mkdir()
+        (broken / "Paper [PDFKEY01].pdf").symlink_to(self.root / "absent.pdf")
+        candidate = service.inspect("PAPER001", broken)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("已经失效", candidate.detail)
+
+        directory_target = self.vault / "directory-target"
+        directory_target.mkdir()
+        target_directory = self.root / "not-a-file"
+        target_directory.mkdir()
+        (directory_target / "Paper [PDFKEY01].pdf").symlink_to(
+            target_directory, target_is_directory=True
+        )
+        candidate = service.inspect("PAPER001", directory_target)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("不是普通文件", candidate.detail)
+
+        multiple = self.vault / "multiple"
+        multiple.mkdir()
+        (multiple / "First [PDFKEY01].pdf").symlink_to(source)
+        (multiple / "Second [PDFKEY02].pdf").symlink_to(source)
+        candidate = service.inspect("PAPER001", multiple)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("有 2 个", candidate.detail)
+
+        ready = self.vault / "ready"
+        ready.mkdir()
+        link = ready / "Paper [PDFKEY01].pdf"
+        link.symlink_to(source)
+        candidate = service.inspect("PAPER001", ready)
+        self.assertEqual(candidate.status, "Ready")
+        self.assertEqual(candidate.pdf, link)
+
+    def test_selected_paper_is_rechecked_after_listing(self):
+        source = self.source()
+        folder = self.vault / "paper"
+        folder.mkdir()
+        (folder / "meta.md").write_text(render_meta(item()["data"]), encoding="utf-8")
+        link = folder / "Paper [PDFKEY01].pdf"
+        link.symlink_to(source)
+        service = ConversionService(self.vault, self.config)
+        self.assertEqual(service.list_candidates()[0].status, "Ready")
+
+        link.unlink()
+        with patch("literature_pipeline.conversion.convert_pdf_into_paper") as converter:
+            summary = service.convert_selected(["PAPER001"], "token")
+        self.assertEqual(summary.failed, 1)
+        self.assertIn("没有受管理", summary.messages[0])
+        converter.assert_not_called()
+
+    def test_output_conflicts_are_unavailable(self):
+        service = ConversionService(self.vault, self.config)
+
+        invalid_full = self.vault / "invalid-full"
+        invalid_full.mkdir()
+        (invalid_full / "full.md").symlink_to(self.root / "absent.md")
+        candidate = service.inspect("PAPER001", invalid_full)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("full.md 不是普通文件", candidate.detail)
+
+        occupied_output = self.vault / "occupied-output"
+        occupied_output.mkdir()
+        (occupied_output / "images").mkdir()
+        candidate = service.inspect("PAPER001", occupied_output)
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("images", candidate.detail)
+
+    def test_duplicate_local_key_is_unavailable(self):
+        for name in ("first", "second"):
+            folder = self.vault / name
+            folder.mkdir()
+            (folder / "meta.md").write_text(render_meta(item()["data"]), encoding="utf-8")
+        candidate = ConversionService(self.vault, self.config).list_candidates()[0]
+        self.assertEqual(candidate.status, "Unavailable")
+        self.assertIn("多个论文目录", candidate.detail)
 
     def test_selected_conversion_failure_does_not_block_later_key(self):
         entries = [item("PAPER001"), item("PAPER002")]
@@ -1065,7 +1155,7 @@ class ConversionServiceTests(unittest.TestCase):
             if len(calls) == 1:
                 raise ConversionError("first failed")
 
-        service = ConversionService(self.vault, self.config, zotero)
+        service = ConversionService(self.vault, self.config)
         with patch("literature_pipeline.conversion.convert_pdf_into_paper", side_effect=convert):
             summary = service.convert_selected(["PAPER001", "PAPER002"], "token")
         self.assertEqual(summary.converted, 1)
@@ -1216,14 +1306,16 @@ class AdapterAndCliTests(unittest.TestCase):
                 self.assertEqual(main(["sync", "--vault", str(vault)]), 0)
             self.assertEqual(len(list(vault.glob("*/meta.md"))), 1)
 
-    def test_cli_convert_requires_token_before_zotero_requests(self):
+    def test_cli_convert_requires_token_without_constructing_zotero(self):
         with tempfile.TemporaryDirectory() as root:
             vault = Path(root) / "vault"
             initialize(vault, "COLLECT1", "http://localhost:23119/api/")
             with (
                 patch.dict("os.environ", {}, clear=True),
-                patch.object(FakeZotero, "children", side_effect=AssertionError("must not run")),
-                patch("literature_pipeline.cli.Zotero", return_value=FakeZotero()),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be constructed"),
+                ),
                 redirect_stderr(io.StringIO()),
             ):
                 result = main(["convert", "--vault", str(vault), "--key", "PAPER001"])
@@ -1252,7 +1344,10 @@ class AdapterAndCliTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 patch.dict("os.environ", {"MINERU_TOKEN": "token"}, clear=True),
-                patch("literature_pipeline.cli.Zotero", return_value=fake_zotero),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be constructed"),
+                ),
                 patch("literature_pipeline.conversion.convert_pdf_into_paper", side_effect=convert),
                 redirect_stdout(output),
             ):
@@ -1278,7 +1373,10 @@ class AdapterAndCliTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 patch.dict("os.environ", {}, clear=True),
-                patch("literature_pipeline.cli.Zotero", return_value=fake),
+                patch(
+                    "literature_pipeline.cli.Zotero",
+                    side_effect=AssertionError("Zotero must not be constructed"),
+                ),
                 redirect_stdout(output),
             ):
                 result = main(["convert", "--vault", str(vault), "--list"])
@@ -1296,7 +1394,7 @@ class AdapterAndCliTests(unittest.TestCase):
 
             with (
                 patch("literature_pipeline.cli.supports_tui", return_value=True),
-                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.Zotero") as zotero_type,
                 patch("literature_pipeline.cli.ConversionService") as service_type,
                 patch(
                     "literature_pipeline.cli.run_conversion_picker",
@@ -1329,6 +1427,7 @@ class AdapterAndCliTests(unittest.TestCase):
                 ],
             )
             self.assertIn("正在检查论文转换状态", output.getvalue())
+            zotero_type.assert_not_called()
 
     def test_cli_bare_convert_cancel_never_loads_token(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1337,7 +1436,7 @@ class AdapterAndCliTests(unittest.TestCase):
             ready = ConversionCandidate("PAPER001", vault / "Alpha", "Ready", "可以转换")
             with (
                 patch("literature_pipeline.cli.supports_tui", return_value=True),
-                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.Zotero") as zotero_type,
                 patch("literature_pipeline.cli.ConversionService") as service_type,
                 patch("literature_pipeline.cli.run_conversion_picker", return_value=None),
                 patch(
@@ -1351,6 +1450,7 @@ class AdapterAndCliTests(unittest.TestCase):
                 result = main(["convert", "--vault", str(vault)])
             self.assertEqual(result, 130)
             service_type.return_value.convert_selected.assert_not_called()
+            zotero_type.assert_not_called()
 
     def test_cli_bare_convert_without_papers_returns_without_token(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1359,7 +1459,7 @@ class AdapterAndCliTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 patch("literature_pipeline.cli.supports_tui", return_value=True),
-                patch("literature_pipeline.cli.Zotero"),
+                patch("literature_pipeline.cli.Zotero") as zotero_type,
                 patch("literature_pipeline.cli.ConversionService") as service_type,
                 patch(
                     "literature_pipeline.cli.run_conversion_picker",
@@ -1375,6 +1475,7 @@ class AdapterAndCliTests(unittest.TestCase):
                 result = main(["convert", "--vault", str(vault)])
             self.assertEqual(result, 0)
             self.assertIn("没有已完成入库的论文", output.getvalue())
+            zotero_type.assert_not_called()
 
     def test_cli_bare_convert_rejects_non_interactive_terminal_before_zotero(self):
         with tempfile.TemporaryDirectory() as root:

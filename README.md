@@ -132,7 +132,7 @@ literature-pipeline convert
   --list
 ```
 
-状态包括 `Ready`、`Converted`、`No PDF`、`Multiple`、`Unavailable` 和 `Conflict`。也可以绕过 TUI，明确传入一个或多个 Zotero item key：
+状态只包括 `Ready`、`Converted` 和 `Unavailable`。`Unavailable` 的详情会说明没有 PDF 链接、存在多个链接、链接失效、输出名称冲突或本地 key 冲突等具体原因。也可以绕过 TUI，明确传入一个或多个 Zotero item key：
 
 ```powershell
 .\.venv\Scripts\literature-pipeline.exe convert `
@@ -150,11 +150,12 @@ MINERU_TOKEN='你的 Token'
 
 真实环境变量优先。Token 不写入 `config.toml`，也不会出现在命令汇总中。`sync`、`convert --list` 以及 TUI 的浏览和取消都不要求 Token；TUI 只有在用户确认选择后才读取 Token。
 
+`convert` 只检查 vault 中已经入库的内容，不访问 Zotero；因此 TUI、`--list` 和 `--key` 均可在 Zotero 关闭时使用。`sync` 负责为新论文建立 PDF 链接，Zotero 附件发生变化后可运行 `link-pdfs` 刷新已有论文的链接。`convert` 始终转换 vault 当前链接的 PDF。
+
 每个被选择的条目必须满足：
 
-- Zotero 顶层条目恰好有一个 PDF child attachment；
-- 该 PDF 已在本机下载；
-- 当前论文目录中恰好有一个指向 Zotero 当前文件的受管理符号链接；
+- 当前论文目录中恰好有一个名称以 `[ATTACHMENT_KEY].pdf` 结尾的受管理符号链接；
+- 该链接有效，且目标是普通文件；
 - `full.md`、`images/` 和 `temp/` 尚未占用。
 
 程序会在上传前完成上述免费检查，并为论文取得独立转换锁。无 PDF、多个 PDF、链接不可用或输出冲突都不会调用 MinerU。已经有普通文件 `full.md` 的论文视为已转换并跳过。
